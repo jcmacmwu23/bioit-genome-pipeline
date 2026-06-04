@@ -99,6 +99,7 @@ let activeSummary = null;
 let activeOrfItems = [];
 let activeCpgItems = [];
 let zoomAbortController = null;
+let isZoomedIn = false; // true while zoomed view is showing — blocks background re-renders
 let activePatternItems = patternRows.map((row) => ({
   pattern_name: row.name,
   pattern_type: row.type,
@@ -615,6 +616,7 @@ function renderSelectedChromosomeVisual() {
   svgParts.push(`<text x="${trackX + trackWidth}" y="${cpgY + cpgH + 14}" text-anchor="end" fill="#5b6672" font-size="11" font-family="IBM Plex Sans">${formatMb(length)}</text>`);
 
   svgParts.push("</svg>");
+  isZoomedIn = false; // overview is now showing
   selectedChromosomeVisual.innerHTML = svgParts.join("");
   attachGenomeTrackEvents(activeChromosome);
 
@@ -760,7 +762,7 @@ function applySummary(summary) {
     orfs: summary.orf_count ? `${summary.orf_count} window ORFs` : "n/a",
   });
   renderSummaryCards();
-  renderSelectedChromosomeVisual();
+  if (!isZoomedIn) renderSelectedChromosomeVisual();
 }
 
 function applyPatterns(items) {
@@ -774,7 +776,7 @@ function applyPatterns(items) {
     });
   });
   renderPatternTable();
-  renderSelectedChromosomeVisual();
+  if (!isZoomedIn) renderSelectedChromosomeVisual();
 }
 
 function applyRegions(items) {
@@ -793,7 +795,7 @@ function applyRegions(items) {
 
   renderOrfTable();
   renderGcBars();
-  renderSelectedChromosomeVisual();
+  if (!isZoomedIn) renderSelectedChromosomeVisual();
 }
 
 function showUnavailableChromosome(chromosome) {
@@ -1044,6 +1046,7 @@ function renderZoomedGenomeTrack(chromosome, viewStart, viewEnd) {
   }
 
   svgParts.push("</svg>");
+  isZoomedIn = true; // block background renders while zoomed
   selectedChromosomeVisual.innerHTML = svgParts.join("");
   selectedChromosomeVisualNote.textContent = `Zoomed: ${formatCoord(viewStart)} – ${formatCoord(viewEnd)} · ${orfs.length} candidate ORFs · ${cpgs.length} CpG sites`;
 
@@ -1235,7 +1238,9 @@ async function pollBatchStatus(chromosome) {
       stopBatchPolling();
       if (bs.status === "SUCCEEDED") {
         // Reload chromosome data — results should now be in S3/Athena
-        setTimeout(() => loadChromosomeDetails(chromosome), 3000);
+        // Wait 5s for CloudFront/DynamoDB cache invalidation to propagate, then
+        // refresh the full inventory (not just the chromosome detail) so status cards update
+        setTimeout(() => hydrateDashboard(), 5000);
       }
     }
   } catch (err) {
