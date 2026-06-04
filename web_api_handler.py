@@ -45,7 +45,11 @@ def cache_get(key: str) -> Optional[Dict]:
 
 
 def cache_put(key: str, data: Dict, ttl_seconds: int = 3600) -> None:
-    """Write an API response to DynamoDB with a TTL. Fire-and-forget."""
+    """Write an API response to DynamoDB with a TTL. Fire-and-forget.
+    Never caches empty items arrays — empty means 'not ready yet', not 'done'."""
+    items = data.get("items")
+    if isinstance(items, list) and len(items) == 0:
+        return  # Don't cache empty results; let the next request retry Athena
     try:
         ddb_client.put_item(
             TableName=CACHE_TABLE,
@@ -1069,7 +1073,9 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
         if cached:
             return json_response(200, cached, cache_seconds=300)
         data = build_chromosome_summary(chromosome)
-        cache_put(ck, data, ttl_seconds=300)
+        # Only cache if Athena actually has pattern/region data for this chromosome
+        if data.get("patterns_ready") and data.get("regions_ready"):
+            cache_put(ck, data, ttl_seconds=300)
         return json_response(200, data, cache_seconds=300)
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/patterns"):
