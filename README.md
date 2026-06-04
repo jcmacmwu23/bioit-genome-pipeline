@@ -28,8 +28,12 @@ AWS Lambda / AWS Batch on Fargate
               Amazon Athena
                      │
          API Gateway  →  Python Lambda (web_api_handler.py)
+                     │          │
+                     │    DynamoDB cache  (sub-ms reads on cache hit)
+                     │          │
+                     │   CloudFront CDN  (edge caching, HTTPS)
                      │
-              S3 Static Website
+              S3 Static Website  ←  CloudFront CDN
                      │
          Interactive Dashboard  (vanilla JS + SVG, no framework)
 ```
@@ -52,11 +56,53 @@ AWS Lambda / AWS Batch on Fargate
 | Compute | AWS Lambda (Python 3.11), AWS Batch on Fargate |
 | Storage | Amazon S3 (Parquet + Snappy), S3 static website |
 | Catalog | AWS Glue, Amazon Athena |
+| Caching | Amazon DynamoDB (API response cache, sub-ms reads) |
+| CDN / HTTPS | Amazon CloudFront (API + dashboard, edge caching) |
 | Job queuing | Amazon SQS |
 | Orchestration | AWS Step Functions |
 | API | Amazon API Gateway HTTP → Python Lambda |
 | Dashboard | Vanilla JS + inline SVG (no framework dependency) |
 | Infrastructure | Terraform |
+
+---
+
+## API Performance Architecture
+
+API responses go through three layers to minimise Athena query latency:
+
+```
+Browser request
+    ↓
+CloudFront edge cache  →  ~0ms (within TTL)
+    ↓ miss
+API Gateway  →  Lambda (kept warm by EventBridge ping every 5 min)
+    ↓
+DynamoDB cache         →  ~1ms (on cache hit)
+    ↓ miss
+Amazon Athena          →  ~5–7s (first request only)
+    ↓
+Write result to DynamoDB (TTL per endpoint)
+```
+
+**Cache TTLs**
+
+| Endpoint | CloudFront TTL | DynamoDB TTL |
+|---|---|---|
+| `/api/status/overview` | 30 s | 30 s |
+| `/api/chromosomes` | 2 min | 2 min |
+| `/api/chromosomes/{chr}/summary` | 5 min | 5 min |
+| `/api/chromosomes/{chr}/patterns` | 1 hr | 1 hr |
+| `/api/chromosomes/{chr}/regions` | 1 hr | 1 hr |
+| POST endpoints | no cache | no cache |
+
+**Cache invalidation after analysis**
+
+When a Batch job completes, `trigger_partition_repair()` in `lambda_handler.py` automatically:
+1. Runs `MSCK REPAIR TABLE` for each updated Glue table (Athena partition sync)
+2. Deletes DynamoDB cache entries for the chromosome (`CHR#{n}#*`, `CHROMOSOMES`, `OVERVIEW`)
+3. Creates a CloudFront invalidation for `/api/chromosomes` and `/api/chromosomes/{chr}/*`
+
+This ensures the dashboard reflects new analysis data within seconds of job completion, without waiting for TTLs to expire.
 
 ---
 
