@@ -98,6 +98,7 @@ let chromosomeInventory = new Map(chromosomeStatus.map((item) => [item.chromosom
 let activeSummary = null;
 let activeOrfItems = [];
 let activeCpgItems = [];
+let zoomAbortController = null;
 let activePatternItems = patternRows.map((row) => ({
   pattern_name: row.name,
   pattern_type: row.type,
@@ -938,21 +939,32 @@ function attachGenomeTrackEvents(chromosome) {
 
 async function zoomToGenomeRegion(chromosome, regionStart, regionEnd) {
   if (!API_BASE_URL) return;
+
+  // Cancel any previous in-flight background fetch for another region
+  if (zoomAbortController) zoomAbortController.abort();
+  zoomAbortController = new AbortController();
+  const signal = zoomAbortController.signal;
+
   const tip = getOrCreateTooltip();
   tip.style.display = "none";
 
-  // Render immediately using already-loaded windowed data — no API wait
+  // Render immediately — no wait for Athena
   applyOrfs([]);
   applyCpgs([]);
   renderZoomedGenomeTrack(chromosome, regionStart, regionEnd);
 
-  // Then fetch individual positions in the background and enhance the view
-  if (!API_BASE_URL) return;
+  // Background fetch: individual ORF + CpG positions
   try {
+    const headers = {};
     const [orfRes, cpgRes] = await Promise.all([
-      fetchJson(`/api/chromosomes/${chromosome}/orfs?start=${regionStart}&end=${regionEnd}`).catch(() => null),
-      fetchJson(`/api/chromosomes/${chromosome}/cpg?start=${regionStart}&end=${regionEnd}`).catch(() => null),
+      fetch(`${API_BASE_URL}/api/chromosomes/${chromosome}/orfs?start=${regionStart}&end=${regionEnd}`, { signal })
+        .then(r => r.ok ? r.json() : null).catch(() => null),
+      fetch(`${API_BASE_URL}/api/chromosomes/${chromosome}/cpg?start=${regionStart}&end=${regionEnd}`, { signal })
+        .then(r => r.ok ? r.json() : null).catch(() => null),
     ]);
+
+    if (signal.aborted) return; // User zoomed out — discard results
+
     const orfs = orfRes && Array.isArray(orfRes.items) ? orfRes.items : [];
     const cpgs = cpgRes && Array.isArray(cpgRes.items) ? cpgRes.items : [];
     if (orfs.length || cpgs.length) {
@@ -961,7 +973,7 @@ async function zoomToGenomeRegion(chromosome, regionStart, regionEnd) {
       renderZoomedGenomeTrack(chromosome, regionStart, regionEnd);
     }
   } catch (err) {
-    console.warn("ORF/CpG detail fetch failed:", err);
+    if (!signal.aborted) console.warn("ORF/CpG detail fetch failed:", err);
   }
 }
 
@@ -1033,6 +1045,8 @@ function renderZoomedGenomeTrack(chromosome, viewStart, viewEnd) {
   selectedChromosomeVisual.querySelectorAll(".zoom-out-btn").forEach((el) => {
     el.addEventListener("click", (e) => {
       e.stopPropagation();
+      // Cancel any background ORF/CpG fetch so it can't overwrite the overview
+      if (zoomAbortController) { zoomAbortController.abort(); zoomAbortController = null; }
       activeOrfItems = [];
       activeCpgItems = [];
       renderSelectedChromosomeVisual();
@@ -1235,6 +1249,7 @@ function startBatchPollingIfNeeded(chromosome) {
 
 function handleChromosomeSelection(chromosome) {
   stopBatchPolling();
+  if (zoomAbortController) { zoomAbortController.abort(); zoomAbortController = null; }
   loadChromosomeDetails(chromosome);
 }
 
