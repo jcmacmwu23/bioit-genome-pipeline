@@ -1775,9 +1775,72 @@ output "dashboard_api_endpoint" {
   description = "HTTP API endpoint for the BioIT dashboard backend"
 }
 
+# CloudFront distribution — HTTPS termination in front of the S3 dashboard bucket
+resource "aws_cloudfront_distribution" "dashboard" {
+  enabled             = true
+  default_root_object = "index.html"
+  price_class         = "PriceClass_100" # North America + Europe only (cheapest)
+
+  origin {
+    domain_name = aws_s3_bucket_website_configuration.dashboard_site.website_endpoint
+    origin_id   = "dashboard-s3-website"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "http-only" # S3 website endpoints are HTTP
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
+  default_cache_behavior {
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "dashboard-s3-website"
+    viewer_protocol_policy = "redirect-to-https"
+
+    forwarded_values {
+      query_string = false
+      cookies { forward = "none" }
+    }
+
+    min_ttl     = 0
+    default_ttl = 0   # Honour no-cache headers from S3 objects
+    max_ttl     = 31536000
+    compress    = true
+  }
+
+  # Return index.html for unknown paths (SPA-style)
+  custom_error_response {
+    error_code         = 403
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+  custom_error_response {
+    error_code         = 404
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+
+  restrictions {
+    geo_restriction { restriction_type = "none" }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true # Free *.cloudfront.net HTTPS cert
+  }
+
+  tags = { Name = "${var.project_name}-dashboard-cdn" }
+}
+
 output "dashboard_website_url" {
   value       = aws_s3_bucket_website_configuration.dashboard_site.website_endpoint
-  description = "S3 static website endpoint for the BioIT dashboard"
+  description = "S3 static website endpoint (HTTP)"
+}
+
+output "dashboard_https_url" {
+  value       = "https://${aws_cloudfront_distribution.dashboard.domain_name}"
+  description = "CloudFront HTTPS URL for the BioIT dashboard (share this one)"
 }
 
 output "batch_job_queue_arn" {

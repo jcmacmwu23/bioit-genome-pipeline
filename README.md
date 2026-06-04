@@ -161,16 +161,24 @@ The API automatically:
 
 ---
 
+## Live Demo
+
+**[https://d11q5vlaasogkc.cloudfront.net](https://d11q5vlaasogkc.cloudfront.net)**
+
+Hosted on AWS S3 + CloudFront (HTTPS). No login required.
+
+---
+
 ## Accessing the Dashboard
 
-After deployment, Terraform outputs two URLs:
+After deployment, Terraform outputs the HTTPS URL:
 
 ```
-dashboard_website_url  = <project>-dashboard-<account>.s3-website-<region>.amazonaws.com
+dashboard_https_url    = https://d<id>.cloudfront.net      ← share this
 dashboard_api_endpoint = https://<api-id>.execute-api.<region>.amazonaws.com
 ```
 
-Open the **dashboard_website_url** in a browser. No login required — the site is publicly hosted on S3.
+Open the **dashboard_https_url** in a browser. No login required.
 
 > **First-time setup:** copy `webapp/config.js.example` to `webapp/config.js`, set
 > `window.BIOIT_API_BASE_URL` to your `dashboard_api_endpoint`, then re-upload `config.js` to the S3
