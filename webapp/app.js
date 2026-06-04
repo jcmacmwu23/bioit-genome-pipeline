@@ -1238,9 +1238,12 @@ async function pollBatchStatus(chromosome) {
       stopBatchPolling();
       if (bs.status === "SUCCEEDED") {
         // Reload chromosome data — results should now be in S3/Athena
-        // Wait 5s for CloudFront/DynamoDB cache invalidation to propagate, then
-        // refresh the full inventory (not just the chromosome detail) so status cards update
-        setTimeout(() => hydrateDashboard(), 5000);
+        // Trigger MSCK REPAIR + cache clearing via API, then reload after propagation
+        if (API_BASE_URL) {
+          fetch(`${API_BASE_URL}/api/chromosomes/${chromosome}/sync`, { method: "POST" })
+            .catch(e => console.warn("sync failed", e));
+        }
+        setTimeout(() => hydrateDashboard(), 8000);
       }
     }
   } catch (err) {

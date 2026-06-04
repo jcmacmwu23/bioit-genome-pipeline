@@ -1159,6 +1159,46 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
         chromosome = path.rstrip("/").split("/")[-2]
         return json_response(200, get_chromosome_batch_status(chromosome))
 
+    if method == "POST" and "/api/chromosomes/" in path and path.endswith("/sync"):
+        chromosome = safe_chromosome(path.rstrip("/").split("/")[-2])
+        # Run MSCK REPAIR + clear DynamoDB + CloudFront for a chromosome that just finished
+        results = {"chromosome": chromosome, "actions": []}
+        try:
+            account_id = sts_client.get_caller_identity()["Account"]
+            results_bucket = resolve_athena_results_bucket()
+            for table in ["genome_sequences", "sequence_patterns", "sequence_regions"]:
+                resp = athena_client.start_query_execution(
+                    QueryString=f"MSCK REPAIR TABLE {resolve_athena_database()}.{table}",
+                    WorkGroup=resolve_athena_workgroup(),
+                    ResultConfiguration={"OutputLocation": f"s3://{results_bucket}/partition-repair/"},
+                )
+                results["actions"].append(f"msck_{table}:{resp['QueryExecutionId']}")
+        except Exception as e:
+            results["msck_error"] = str(e)
+        try:
+            chr_upper = chromosome.upper() if chromosome.lower() in ("x", "y") else chromosome
+            cache_delete([f"CHR#{chr_upper}#SUMMARY", f"CHR#{chr_upper}#PATTERNS",
+                          f"CHR#{chr_upper}#REGIONS", "CHROMOSOMES", "OVERVIEW"])
+            results["actions"].append("ddb_cleared")
+        except Exception as e:
+            results["ddb_error"] = str(e)
+        try:
+            cf_id = os.environ.get("API_CF_DISTRIBUTION_ID")
+            if cf_id:
+                import time as _t
+                cf_client = boto3.client("cloudfront")
+                cf_client.create_invalidation(
+                    DistributionId=cf_id,
+                    InvalidationBatch={
+                        "Paths": {"Quantity": 2, "Items": ["/api/chromosomes", f"/api/chromosomes/{chromosome}/*"]},
+                        "CallerReference": f"sync-{chromosome}-{int(_t.time())}",
+                    },
+                )
+                results["actions"].append("cf_invalidated")
+        except Exception as e:
+            results["cf_error"] = str(e)
+        return json_response(202, results)
+
     if method == "POST" and "/api/chromosomes/" in path and path.endswith("/analyze"):
         chromosome = path.rstrip("/").split("/")[-2]
         payload = parse_body(event)
