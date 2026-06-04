@@ -93,7 +93,12 @@ ALLOWED_JOB_TYPES = {"sequence_analysis", "gene_annotations"}
 FULL_ANALYSIS_MAX_BASES = int(os.environ.get("FULL_ANALYSIS_MAX_BASES", "60000000"))
 
 
-def json_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
+def json_response(status_code: int, body: Dict[str, Any], cache_seconds: int = 0) -> Dict[str, Any]:
+    cache_control = (
+        f"public, max-age={cache_seconds}, stale-while-revalidate=60"
+        if cache_seconds > 0
+        else "no-cache, no-store, must-revalidate"
+    )
     return {
         "statusCode": status_code,
         "headers": {
@@ -101,6 +106,7 @@ def json_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": "Content-Type",
             "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+            "Cache-Control": cache_control,
         },
         "body": json.dumps(body),
     }
@@ -1000,14 +1006,14 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
         return json_response(200, {"ok": True})
 
     if method == "GET" and path.endswith("/api/status/overview"):
-        return json_response(200, build_overview())
+        return json_response(200, build_overview(), cache_seconds=30)
 
     if method == "GET" and path.endswith("/api/chromosomes"):
-        return json_response(200, {"items": build_chromosome_inventory()})
+        return json_response(200, {"items": build_chromosome_inventory()}, cache_seconds=120)
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/summary"):
         chromosome = path.rstrip("/").split("/")[-2]
-        return json_response(200, build_chromosome_summary(chromosome))
+        return json_response(200, build_chromosome_summary(chromosome), cache_seconds=300)
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/patterns"):
         chromosome = path.rstrip("/").split("/")[-2]
@@ -1017,6 +1023,7 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
                 "chromosome": safe_chromosome(chromosome),
                 "items": get_chromosome_pattern_rows(chromosome),
             },
+            cache_seconds=3600,
         )
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/regions"):
@@ -1027,6 +1034,7 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
                 "chromosome": safe_chromosome(chromosome),
                 "items": get_chromosome_region_rows(chromosome),
             },
+            cache_seconds=3600,
         )
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/orfs"):
@@ -1120,6 +1128,10 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    # EventBridge keep-warm ping — return immediately without touching Athena
+    if event.get("source") == "warmup":
+        logger.info("Keep-warm ping received")
+        return {"statusCode": 200, "body": "warm"}
     try:
         return route(event)
     except ValueError as exc:

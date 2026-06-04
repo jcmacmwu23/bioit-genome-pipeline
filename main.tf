@@ -780,12 +780,147 @@ resource "aws_s3_object" "dashboard_site_files" {
   )
 }
 
+# ── CloudFront in front of API Gateway ──────────────────────────────────────
+# Custom cache policies — forward query strings so ?start=&end= reach the origin
+
+resource "aws_cloudfront_cache_policy" "api_short" {
+  name        = "${var.project_name}-api-2min"
+  default_ttl = 120
+  max_ttl     = 300
+  min_ttl     = 0
+  parameters_in_cache_key_and_forwarded_to_origin {
+    cookies_config      { cookie_behavior       = "none" }
+    headers_config      { header_behavior       = "none" }
+    query_strings_config { query_string_behavior = "all" }
+  }
+}
+
+resource "aws_cloudfront_cache_policy" "api_long" {
+  name        = "${var.project_name}-api-1hr"
+  default_ttl = 3600
+  max_ttl     = 86400
+  min_ttl     = 0
+  parameters_in_cache_key_and_forwarded_to_origin {
+    cookies_config      { cookie_behavior       = "none" }
+    headers_config      { header_behavior       = "none" }
+    query_strings_config { query_string_behavior = "all" }
+  }
+}
+
+resource "aws_cloudfront_distribution" "api" {
+  enabled     = true
+  price_class = "PriceClass_100"
+
+  origin {
+    domain_name = trimprefix(aws_apigatewayv2_api.dashboard_api.api_endpoint, "https://")
+    origin_id   = "apigw"
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "https-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
+  # Default — no cache (POST / PUT / DELETE, or anything not matched below)
+  default_cache_behavior {
+    allowed_methods          = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods           = ["GET", "HEAD"]
+    target_origin_id         = "apigw"
+    viewer_protocol_policy   = "https-only"
+    cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # AWS CachingDisabled
+    origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac" # AllViewerExceptHostHeader
+    compress                 = true
+  }
+
+  # /api/chromosomes — 2-min cache (changes when a new analysis completes)
+  ordered_cache_behavior {
+    path_pattern             = "/api/chromosomes"
+    allowed_methods          = ["GET", "HEAD", "OPTIONS"]
+    cached_methods           = ["GET", "HEAD"]
+    target_origin_id         = "apigw"
+    viewer_protocol_policy   = "https-only"
+    cache_policy_id          = aws_cloudfront_cache_policy.api_short.id
+    origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
+    compress                 = true
+  }
+
+  # /api/chromosomes/*/summary — 5-min cache
+  ordered_cache_behavior {
+    path_pattern             = "/api/chromosomes/*/summary"
+    allowed_methods          = ["GET", "HEAD", "OPTIONS"]
+    cached_methods           = ["GET", "HEAD"]
+    target_origin_id         = "apigw"
+    viewer_protocol_policy   = "https-only"
+    cache_policy_id          = aws_cloudfront_cache_policy.api_short.id
+    origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
+    compress                 = true
+  }
+
+  # /api/chromosomes/*/patterns — 1-hour cache (stable after analysis)
+  ordered_cache_behavior {
+    path_pattern             = "/api/chromosomes/*/patterns"
+    allowed_methods          = ["GET", "HEAD", "OPTIONS"]
+    cached_methods           = ["GET", "HEAD"]
+    target_origin_id         = "apigw"
+    viewer_protocol_policy   = "https-only"
+    cache_policy_id          = aws_cloudfront_cache_policy.api_long.id
+    origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
+    compress                 = true
+  }
+
+  # /api/chromosomes/*/regions — 1-hour cache
+  ordered_cache_behavior {
+    path_pattern             = "/api/chromosomes/*/regions"
+    allowed_methods          = ["GET", "HEAD", "OPTIONS"]
+    cached_methods           = ["GET", "HEAD"]
+    target_origin_id         = "apigw"
+    viewer_protocol_policy   = "https-only"
+    cache_policy_id          = aws_cloudfront_cache_policy.api_long.id
+    origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
+    compress                 = true
+  }
+
+  restrictions {
+    geo_restriction { restriction_type = "none" }
+  }
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+  tags = { Name = "${var.project_name}-api-cdn" }
+}
+
+# ── Lambda keep-warm (EventBridge ping every 5 min — eliminates cold starts) ─
+
+resource "aws_cloudwatch_event_rule" "api_warmup" {
+  name                = "${var.project_name}-api-warmup"
+  description         = "Keep web API Lambda warm to avoid cold starts"
+  schedule_expression = "rate(5 minutes)"
+}
+
+resource "aws_cloudwatch_event_target" "api_warmup" {
+  rule      = aws_cloudwatch_event_rule.api_warmup.name
+  target_id = "warm-web-api"
+  arn       = aws_lambda_function.web_api.arn
+  input     = jsonencode({ "source" = "warmup" })
+}
+
+resource "aws_lambda_permission" "allow_eventbridge_warmup" {
+  statement_id  = "AllowEventBridgeWarmup"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.web_api.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.api_warmup.arn
+}
+
+# ── config.js now points at CloudFront API URL (HTTPS, cached) ───────────────
+
 resource "aws_s3_object" "dashboard_site_config" {
   bucket       = aws_s3_bucket.dashboard_site.id
   key          = "config.js"
-  content      = "window.BIOIT_API_BASE_URL = '${aws_apigatewayv2_api.dashboard_api.api_endpoint}';\n"
+  content      = "window.BIOIT_API_BASE_URL = 'https://${aws_cloudfront_distribution.api.domain_name}';\n"
   content_type = "application/javascript"
-  etag         = md5("window.BIOIT_API_BASE_URL = '${aws_apigatewayv2_api.dashboard_api.api_endpoint}';\n")
+  etag         = md5("window.BIOIT_API_BASE_URL = 'https://${aws_cloudfront_distribution.api.domain_name}';\n")
 }
 
 # Lambda trigger from SQS
@@ -1841,6 +1976,11 @@ output "dashboard_website_url" {
 output "dashboard_https_url" {
   value       = "https://${aws_cloudfront_distribution.dashboard.domain_name}"
   description = "CloudFront HTTPS URL for the BioIT dashboard (share this one)"
+}
+
+output "api_cdn_url" {
+  value       = "https://${aws_cloudfront_distribution.api.domain_name}"
+  description = "CloudFront HTTPS URL for the API (cached, no cold starts)"
 }
 
 output "batch_job_queue_arn" {
