@@ -1161,10 +1161,14 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
 
     if method == "POST" and "/api/chromosomes/" in path and path.endswith("/sync"):
         chromosome = safe_chromosome(path.rstrip("/").split("/")[-2])
-        # Run MSCK REPAIR + clear DynamoDB + CloudFront for a chromosome that just finished
         results = {"chromosome": chromosome, "actions": []}
+        import time as _t
+
+        # Step 1: Run MSCK REPAIR and WAIT for it to complete before clearing caches.
+        # Clearing cache before MSCK completes causes a race where the dashboard fetches
+        # empty Athena results and CloudFront caches the empty response for 1 hour.
+        repair_ids = []
         try:
-            account_id = sts_client.get_caller_identity()["Account"]
             results_bucket = resolve_athena_results_bucket()
             for table in ["genome_sequences", "sequence_patterns", "sequence_regions"]:
                 resp = athena_client.start_query_execution(
@@ -1172,9 +1176,24 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
                     WorkGroup=resolve_athena_workgroup(),
                     ResultConfiguration={"OutputLocation": f"s3://{results_bucket}/partition-repair/"},
                 )
+                repair_ids.append(resp["QueryExecutionId"])
                 results["actions"].append(f"msck_{table}:{resp['QueryExecutionId']}")
+            # Wait for all MSCK repairs to complete (max 50s)
+            deadline = _t.time() + 50
+            pending = set(repair_ids)
+            while pending and _t.time() < deadline:
+                _t.sleep(3)
+                for qid in list(pending):
+                    state = athena_client.get_query_execution(
+                        QueryExecutionId=qid
+                    )["QueryExecution"]["Status"]["State"]
+                    if state in ("SUCCEEDED", "FAILED", "CANCELLED"):
+                        pending.discard(qid)
+            results["actions"].append(f"msck_waited:{len(repair_ids)-len(pending)}/{len(repair_ids)}_done")
         except Exception as e:
             results["msck_error"] = str(e)
+
+        # Step 2: Clear DynamoDB cache
         try:
             chr_upper = chromosome.upper() if chromosome.lower() in ("x", "y") else chromosome
             cache_delete([f"CHR#{chr_upper}#SUMMARY", f"CHR#{chr_upper}#PATTERNS",
@@ -1182,10 +1201,11 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
             results["actions"].append("ddb_cleared")
         except Exception as e:
             results["ddb_error"] = str(e)
+
+        # Step 3: Invalidate CloudFront so no stale empty responses are served
         try:
             cf_id = os.environ.get("API_CF_DISTRIBUTION_ID")
             if cf_id:
-                import time as _t
                 cf_client = boto3.client("cloudfront")
                 cf_client.create_invalidation(
                     DistributionId=cf_id,
@@ -1197,7 +1217,7 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
                 results["actions"].append("cf_invalidated")
         except Exception as e:
             results["cf_error"] = str(e)
-        return json_response(202, results)
+        return json_response(200, results)
 
     if method == "POST" and "/api/chromosomes/" in path and path.endswith("/analyze"):
         chromosome = path.rstrip("/").split("/")[-2]
