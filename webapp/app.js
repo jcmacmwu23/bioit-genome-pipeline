@@ -1177,8 +1177,10 @@ async function loadChromosomeDetails(chromosome) {
   }
 
   if (summary) applySummary(summary);
-  if (patterns && Array.isArray(patterns.items)) applyPatterns(patterns.items);
-  if (regions && Array.isArray(regions.items)) applyRegions(regions.items);
+  // Only replace existing data with non-empty results — empty arrays from Athena cold/miss
+  // must not clear a visualization that is already showing correctly
+  if (patterns && Array.isArray(patterns.items) && patterns.items.length > 0) applyPatterns(patterns.items);
+  if (regions && Array.isArray(regions.items) && regions.items.length > 0) applyRegions(regions.items);
 
   renderChromosomeGrid();
   startBatchPollingIfNeeded(chromosome);
