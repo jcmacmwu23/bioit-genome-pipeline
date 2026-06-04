@@ -161,6 +161,76 @@ The API automatically:
 
 ---
 
+## Accessing the Dashboard
+
+After deployment, Terraform outputs two URLs:
+
+```
+dashboard_website_url  = <project>-dashboard-<account>.s3-website-<region>.amazonaws.com
+dashboard_api_endpoint = https://<api-id>.execute-api.<region>.amazonaws.com
+```
+
+Open the **dashboard_website_url** in a browser. No login required — the site is publicly hosted on S3.
+
+> **First-time setup:** copy `webapp/config.js.example` to `webapp/config.js`, set
+> `window.BIOIT_API_BASE_URL` to your `dashboard_api_endpoint`, then re-upload `config.js` to the S3
+> dashboard bucket:
+> ```bash
+> aws s3 cp webapp/config.js s3://<project>-dashboard-<account>/config.js \
+>   --content-type "application/javascript"
+> ```
+
+---
+
+## Using the Dashboard
+
+### Selecting a chromosome
+
+- **Completion map** (pill grid) — click any numbered pill to load that chromosome
+- **Chromosome atlas** — click any vertical bar in the atlas to select it
+- The status banner updates immediately; data loads within a few seconds
+
+### Understanding the status cards
+
+| Card | Meaning |
+|---|---|
+| **Sequence Status: Ready** | Raw FASTA downloaded and stored in S3 |
+| **Pattern Status: Ready** | Motif & ORF hits computed and queryable in Athena |
+| **Region Status: Ready** | 100 kb windowed summaries (GC, ORF density, CpG) available |
+| **Full Analysis Path: Batch** | Chromosome > 60 Mb — full analysis runs on AWS Batch / Fargate |
+| **Full Analysis Path: Complete** | All three datasets exist for this chromosome |
+
+### Running full analysis
+
+1. Select a chromosome with **Sequence Status: Ready** but patterns/regions pending
+2. Click **Run Full Analysis on Batch** (large chromosomes) or **Run Full Analysis** (small)
+3. The Pattern and Region status cards switch to:
+   > *Running on Batch (8.2 min · ~15% · ETA ~46 min left)*
+4. Progress updates automatically every 30 seconds — no page refresh needed
+5. When the job completes the cards flip to **Ready** and the visualization loads
+
+### Chromosome lens visualization
+
+The **Selected chromosome lens** card shows three layers for the active chromosome:
+
+| Layer | What it shows |
+|---|---|
+| **Ideogram bar** | ORF density gradient — beige (low) → purple (high); red band = centromere |
+| **Analysis window track** | GC-colored 100 kb windows with orange motif dots and purple ORF flags |
+| **CpG motif density** | Teal bar chart of CpG/motif density across the full chromosome |
+
+**Hovering** over the ideogram shows a tooltip: genomic coordinates, ORF count, CpG hits, GC%.
+
+**Clicking** a region zooms in and loads individual ORF positions (purple bars, split by strand) and CpG sites (teal ticks) from Athena.
+
+**← Zoom out** returns to the full chromosome view.
+
+### Submitting a full 24-chromosome batch
+
+Scroll to the **Controls** section → **Full human reference** → **Prepare full batch request** → submit via API.
+
+---
+
 ## Key Files
 
 | File | Purpose |
