@@ -1143,31 +1143,25 @@ async function loadChromosomeDetails(chromosome) {
   selectedChromosomeStatus.textContent = `Loading chromosome ${chromosome} data…`;
   selectedChromosomeVisualNote.textContent = `Fetching analysis data for chromosome ${chromosome}…`;
 
-  try {
-    const [summary, patterns, regions] = await Promise.all([
-      fetchJson(`/api/chromosomes/${chromosome}/summary`),
-      fetchJson(`/api/chromosomes/${chromosome}/patterns`),
-      fetchJson(`/api/chromosomes/${chromosome}/regions`),
-    ]);
+  // Use individual .catch() so one slow/failed endpoint doesn't clear all data
+  const [summary, patterns, regions] = await Promise.all([
+    fetchJson(`/api/chromosomes/${chromosome}/summary`).catch(e => { console.warn("summary failed", e); return null; }),
+    fetchJson(`/api/chromosomes/${chromosome}/patterns`).catch(e => { console.warn("patterns failed", e); return null; }),
+    fetchJson(`/api/chromosomes/${chromosome}/regions`).catch(e => { console.warn("regions failed", e); return null; }),
+  ]);
 
-    if (summary) {
-      applySummary(summary);
-    }
-
-    if (patterns && Array.isArray(patterns.items)) {
-      applyPatterns(patterns.items);
-    }
-
-    if (regions && Array.isArray(regions.items)) {
-      applyRegions(regions.items);
-    }
-
-    renderChromosomeGrid();
-    startBatchPollingIfNeeded(chromosome);
-  } catch (error) {
-    console.warn(`Unable to load chromosome ${chromosome} data.`, error);
+  if (!summary && !patterns && !regions) {
+    // All three failed — chromosome truly unavailable
     showUnavailableChromosome(chromosome);
+    return;
   }
+
+  if (summary) applySummary(summary);
+  if (patterns && Array.isArray(patterns.items)) applyPatterns(patterns.items);
+  if (regions && Array.isArray(regions.items)) applyRegions(regions.items);
+
+  renderChromosomeGrid();
+  startBatchPollingIfNeeded(chromosome);
 }
 
 async function hydrateDashboard() {

@@ -476,9 +476,13 @@ resource "aws_batch_job_definition" "full_analysis" {
       }
     }
     environment = [
-      { name = "OUTPUT_BUCKET", value = aws_s3_bucket.genome_output.id },
-      { name = "TEMP_BUCKET", value = aws_s3_bucket.genome_temp.id },
-      { name = "NCBI_EMAIL", value = var.ncbi_email }
+      { name = "OUTPUT_BUCKET",          value = aws_s3_bucket.genome_output.id },
+      { name = "TEMP_BUCKET",            value = aws_s3_bucket.genome_temp.id },
+      { name = "NCBI_EMAIL",             value = var.ncbi_email },
+      { name = "ATHENA_DATABASE",        value = aws_glue_catalog_database.genome_db.name },
+      { name = "ATHENA_WORKGROUP",       value = aws_athena_workgroup.genome_workgroup.name },
+      { name = "ATHENA_RESULTS_BUCKET",  value = aws_s3_bucket.athena_results.id },
+      { name = "API_CF_DISTRIBUTION_ID", value = aws_cloudfront_distribution.api.id }
     ]
   })
 }
