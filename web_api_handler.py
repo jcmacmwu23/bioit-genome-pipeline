@@ -1166,34 +1166,55 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
         results = {"chromosome": chromosome, "actions": []}
         import time as _t
 
-        # Step 1: Run MSCK REPAIR and WAIT for it to complete before clearing caches.
-        # Clearing cache before MSCK completes causes a race where the dashboard fetches
-        # empty Athena results and CloudFront caches the empty response for 1 hour.
-        repair_ids = []
+        # Step 1: Explicitly add the partition for this chromosome using ALTER TABLE.
+        # MSCK REPAIR can miss partitions in race conditions (file just written vs scan timing).
+        # ALTER TABLE ADD PARTITION with a specific path is deterministic and immediate.
         try:
             results_bucket = resolve_athena_results_bucket()
-            for table in ["genome_sequences", "sequence_patterns", "sequence_regions"]:
+            bucket = resolve_output_bucket()
+            table_dirs = {
+                "genome_sequences": "genome_data",
+                "sequence_patterns": "pattern_data",
+                "sequence_regions": "region_data",
+            }
+            db = resolve_athena_database()
+            wg = resolve_athena_workgroup()
+            chr_upper = chromosome.upper() if chromosome.lower() in ("x", "y") else chromosome
+
+            # Detect year/month from the latest S3 object for this chromosome
+            import datetime as _dt
+            now = _dt.datetime.utcnow()
+            year, month = str(now.year), f"{now.month:02d}"
+
+            add_ids = []
+            for table, prefix in table_dirs.items():
+                location = (f"s3://{bucket}/{prefix}/source=ncbi/species=homo_sapiens"
+                            f"/chr={chromosome}/year={year}/month={month}/")
+                sql = (f"ALTER TABLE {db}.{table} ADD IF NOT EXISTS "
+                       f"PARTITION (source='ncbi', species='homo_sapiens', "
+                       f"chr='{chromosome}', year='{year}', month='{month}') "
+                       f"LOCATION '{location}'")
                 resp = athena_client.start_query_execution(
-                    QueryString=f"MSCK REPAIR TABLE {resolve_athena_database()}.{table}",
-                    WorkGroup=resolve_athena_workgroup(),
+                    QueryString=sql,
+                    WorkGroup=wg,
                     ResultConfiguration={"OutputLocation": f"s3://{results_bucket}/partition-repair/"},
                 )
-                repair_ids.append(resp["QueryExecutionId"])
-                results["actions"].append(f"msck_{table}:{resp['QueryExecutionId']}")
-            # Wait for all MSCK repairs to complete (max 50s)
-            deadline = _t.time() + 50
-            pending = set(repair_ids)
+                add_ids.append(resp["QueryExecutionId"])
+
+            # Wait for ALTER TABLE queries (fast, usually <5s)
+            deadline = _t.time() + 30
+            pending = set(add_ids)
             while pending and _t.time() < deadline:
-                _t.sleep(3)
+                _t.sleep(2)
                 for qid in list(pending):
                     state = athena_client.get_query_execution(
                         QueryExecutionId=qid
                     )["QueryExecution"]["Status"]["State"]
                     if state in ("SUCCEEDED", "FAILED", "CANCELLED"):
                         pending.discard(qid)
-            results["actions"].append(f"msck_waited:{len(repair_ids)-len(pending)}/{len(repair_ids)}_done")
+            results["actions"].append(f"partition_added:{len(add_ids)}_tables")
         except Exception as e:
-            results["msck_error"] = str(e)
+            results["partition_error"] = str(e)
 
         # Step 2: Clear DynamoDB cache
         try:
