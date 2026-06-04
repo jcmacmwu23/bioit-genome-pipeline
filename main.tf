@@ -649,9 +649,10 @@ resource "aws_lambda_function" "web_api" {
       ATHENA_DATABASE       = aws_glue_catalog_database.genome_db.name
       ATHENA_WORKGROUP      = aws_athena_workgroup.genome_workgroup.name
       ATHENA_RESULTS_BUCKET = aws_s3_bucket.athena_results.id
-      BATCH_JOB_QUEUE       = aws_batch_job_queue.full_analysis.arn
-      BATCH_JOB_DEFINITION  = aws_batch_job_definition.full_analysis.arn
-      CACHE_TABLE           = aws_dynamodb_table.api_cache.name
+      BATCH_JOB_QUEUE        = aws_batch_job_queue.full_analysis.arn
+      BATCH_JOB_DEFINITION   = aws_batch_job_definition.full_analysis.arn
+      CACHE_TABLE            = aws_dynamodb_table.api_cache.name
+      API_CF_DISTRIBUTION_ID = aws_cloudfront_distribution.api.id
     }
   }
 
