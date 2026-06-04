@@ -771,12 +771,14 @@ function applySummary(summary) {
       orfs: "Loading from Athena…",
     });
     renderSummaryCards();
-    // Sync the lens note so both cards tell the same story
-    if (selectedChromosomeVisualNote && !isZoomedIn) {
-      selectedChromosomeVisualNote.textContent =
-        "Loading analysis data from Athena — pattern and region windows will appear shortly.";
+    if (!isZoomedIn) {
+      renderSelectedChromosomeVisual();
+      // Set AFTER render — renderSelectedChromosomeVisual overwrites the note text
+      if (selectedChromosomeVisualNote) {
+        selectedChromosomeVisualNote.textContent =
+          "Loading analysis data from Athena — pattern and region windows will appear shortly.";
+      }
     }
-    if (!isZoomedIn) renderSelectedChromosomeVisual();
     return;
   }
 
@@ -1305,6 +1307,10 @@ function startBatchPollingIfNeeded(chromosome) {
 function handleChromosomeSelection(chromosome) {
   stopBatchPolling();
   if (zoomAbortController) { zoomAbortController.abort(); zoomAbortController = null; }
+  // Clear stale pattern badges from the previous chromosome
+  activePatternItems = [];
+  patternRows.length = 0;
+  renderPatternTable();
   loadChromosomeDetails(chromosome);
 }
 
