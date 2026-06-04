@@ -46,10 +46,11 @@ DATASET_TABLE_MAP = {
 }
 
 
-def trigger_partition_repair(uploaded_dataset_keys: List[str]) -> None:
+def trigger_partition_repair(uploaded_dataset_keys: List[str], chromosome: Optional[str] = None) -> None:
     """
-    Fire-and-forget MSCK REPAIR TABLE for each Glue table whose partition was
-    just extended by a new Parquet upload. Does not wait for completion.
+    1. Fire-and-forget MSCK REPAIR TABLE for each updated Glue table.
+    2. Invalidate CloudFront API cache for the chromosome so stale
+       'pending' responses are not served after analysis completes.
     """
     tables = [DATASET_TABLE_MAP[k] for k in uploaded_dataset_keys if k in DATASET_TABLE_MAP]
     if not tables:
@@ -57,6 +58,8 @@ def trigger_partition_repair(uploaded_dataset_keys: List[str]) -> None:
     try:
         account_id = sts_client.get_caller_identity()['Account']
         results_bucket = ATHENA_RESULTS_BUCKET or f"genome-pipeline-athena-results-{account_id}"
+
+        # 1. MSCK REPAIR (async, no wait)
         for table in tables:
             try:
                 resp = athena_client.start_query_execution(
@@ -69,6 +72,27 @@ def trigger_partition_repair(uploaded_dataset_keys: List[str]) -> None:
                 logger.info(f"MSCK REPAIR started for {table}: {resp['QueryExecutionId']}")
             except Exception as exc:
                 logger.warning(f"MSCK REPAIR could not start for {table}: {exc}")
+
+        # 2. CloudFront cache invalidation so the dashboard sees fresh data immediately
+        cf_distribution_id = os.environ.get('API_CF_DISTRIBUTION_ID')
+        if cf_distribution_id and chromosome:
+            try:
+                import time
+                cf_client = boto3.client('cloudfront')
+                paths = [
+                    '/api/chromosomes',
+                    f'/api/chromosomes/{chromosome}/*',
+                ]
+                cf_client.create_invalidation(
+                    DistributionId=cf_distribution_id,
+                    InvalidationBatch={
+                        'Paths': {'Quantity': len(paths), 'Items': paths},
+                        'CallerReference': f"post-analysis-{chromosome}-{int(time.time())}",
+                    },
+                )
+                logger.info(f"CloudFront cache invalidated for chr{chromosome}")
+            except Exception as exc:
+                logger.warning(f"CloudFront invalidation failed: {exc}")
     except Exception as exc:
         logger.warning(f"trigger_partition_repair failed: {exc}")
 HUMAN_CHROMOSOME_LENGTHS = {
@@ -776,8 +800,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     'analysis_mode': analysis_mode,
                 })
 
-                # Kick off async Glue partition repair so Athena sees the new data immediately
-                trigger_partition_repair([k for k in dataset_keys if k in DATASET_TABLE_MAP])
+                # Kick off async Glue partition repair + CloudFront invalidation
+                trigger_partition_repair(
+                    [k for k in dataset_keys if k in DATASET_TABLE_MAP],
+                    chromosome=derive_chromosome_label(job_event),
+                )
 
         return {
             'statusCode': 200,

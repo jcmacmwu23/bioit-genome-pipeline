@@ -219,6 +219,11 @@ resource "aws_iam_role_policy" "lambda_policy" {
         Resource = "*"
       },
       {
+        Effect   = "Allow"
+        Action   = ["cloudfront:CreateInvalidation"]
+        Resource = "*"
+      },
+      {
         Effect = "Allow"
         Action = [
           "s3:GetObject",
@@ -267,12 +272,13 @@ resource "aws_lambda_function" "genome_processor" {
 
   environment {
     variables = {
-      OUTPUT_BUCKET         = aws_s3_bucket.genome_output.id
-      TEMP_BUCKET           = aws_s3_bucket.genome_temp.id
-      NCBI_EMAIL            = var.ncbi_email
-      ATHENA_DATABASE       = aws_glue_catalog_database.genome_db.name
-      ATHENA_WORKGROUP      = aws_athena_workgroup.genome_workgroup.name
-      ATHENA_RESULTS_BUCKET = aws_s3_bucket.athena_results.id
+      OUTPUT_BUCKET          = aws_s3_bucket.genome_output.id
+      TEMP_BUCKET            = aws_s3_bucket.genome_temp.id
+      NCBI_EMAIL             = var.ncbi_email
+      ATHENA_DATABASE        = aws_glue_catalog_database.genome_db.name
+      ATHENA_WORKGROUP       = aws_athena_workgroup.genome_workgroup.name
+      ATHENA_RESULTS_BUCKET  = aws_s3_bucket.athena_results.id
+      API_CF_DISTRIBUTION_ID = aws_cloudfront_distribution.api.id
     }
   }
 
