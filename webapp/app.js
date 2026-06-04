@@ -799,6 +799,8 @@ function applyRegions(items) {
 }
 
 function showUnavailableChromosome(chromosome) {
+  // Never wipe the visualization while the user is in a zoomed view
+  if (isZoomedIn) return;
   activeSummary = null;
   activePatternItems = [];
   activeRegionItems = [];
