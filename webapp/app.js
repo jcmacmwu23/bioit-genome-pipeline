@@ -1193,6 +1193,11 @@ async function loadChromosomeDetails(chromosome) {
     return;
   }
 
+  // Clear stale pattern badges from any previous chromosome immediately
+  activePatternItems = [];
+  patternRows.length = 0;
+  renderPatternTable();
+
   // Show immediate loading feedback
   selectedChromosomeStatus.textContent = `Loading chromosome ${chromosome} data…`;
   selectedChromosomeVisualNote.textContent = `Fetching analysis data for chromosome ${chromosome}…`;
