@@ -1073,8 +1073,10 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
         if cached:
             return json_response(200, cached, cache_seconds=300)
         data = build_chromosome_summary(chromosome)
-        # Only cache if Athena actually has pattern/region data for this chromosome
-        if data.get("patterns_ready") and data.get("regions_ready"):
+        # Only cache when Athena has real pattern data — never cache 0-hit summaries
+        # (a zero hit count means MSCK REPAIR hasn't propagated yet)
+        if (data.get("patterns_ready") and data.get("regions_ready")
+                and data.get("pattern_hit_count") not in (None, "", "0")):
             cache_put(ck, data, ttl_seconds=300)
         return json_response(200, data, cache_seconds=300)
 

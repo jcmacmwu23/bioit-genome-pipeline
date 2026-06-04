@@ -1239,10 +1239,17 @@ async function pollBatchStatus(chromosome) {
       if (bs.status === "SUCCEEDED") {
         // Reload chromosome data — results should now be in S3/Athena
         // Trigger MSCK REPAIR + cache clearing — /sync waits for Athena before returning
-        // then reload after CloudFront invalidation propagates (~5s)
+        // Show progress in the status cards so the user knows what's happening
+        const syncMsg = "Syncing Athena partitions… (~30s)";
+        if (selectedPatternDetail) selectedPatternDetail.textContent = syncMsg;
+        if (selectedRegionDetail) selectedRegionDetail.textContent = syncMsg;
         if (API_BASE_URL) {
           fetch(`${API_BASE_URL}/api/chromosomes/${chromosome}/sync`, { method: "POST" })
-            .then(() => setTimeout(() => hydrateDashboard(), 5000))
+            .then(() => {
+              if (selectedPatternDetail) selectedPatternDetail.textContent = "Sync complete — loading results…";
+              if (selectedRegionDetail) selectedRegionDetail.textContent = "Sync complete — loading results…";
+              setTimeout(() => hydrateDashboard(), 5000);
+            })
             .catch(e => { console.warn("sync failed", e); setTimeout(() => hydrateDashboard(), 10000); });
         } else {
           setTimeout(() => hydrateDashboard(), 10000);
