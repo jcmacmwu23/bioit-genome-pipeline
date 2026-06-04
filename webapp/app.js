@@ -761,6 +761,16 @@ function applySummary(summary) {
   const hasRealData = summary.pattern_hit_count && summary.pattern_hit_count !== "0";
   const patternsKnownReady = summary.patterns_ready && summary.regions_ready;
   if (patternsKnownReady && !hasRealData) {
+    // Show a "loading" placeholder so previous chromosome's data doesn't show
+    chromosomeSummaries.length = 0;
+    chromosomeSummaries.push({
+      chromosome: summary.chromosome,
+      length: summary.sequence_length ? `${Number(summary.sequence_length).toLocaleString()} bp` : "n/a",
+      gc: summary.avg_gc_content ? `${summary.avg_gc_content}%` : "n/a",
+      patterns: "Loading from Athena…",
+      orfs: "Loading from Athena…",
+    });
+    renderSummaryCards();
     if (!isZoomedIn) renderSelectedChromosomeVisual();
     return;
   }
