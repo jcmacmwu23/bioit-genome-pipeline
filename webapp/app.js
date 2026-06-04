@@ -771,6 +771,11 @@ function applySummary(summary) {
       orfs: "Loading from Athena…",
     });
     renderSummaryCards();
+    // Sync the lens note so both cards tell the same story
+    if (selectedChromosomeVisualNote && !isZoomedIn) {
+      selectedChromosomeVisualNote.textContent =
+        "Loading analysis data from Athena — pattern and region windows will appear shortly.";
+    }
     if (!isZoomedIn) renderSelectedChromosomeVisual();
     return;
   }
