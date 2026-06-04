@@ -761,7 +761,11 @@ function applySummary(summary) {
   const hasRealData = summary.pattern_hit_count && summary.pattern_hit_count !== "0";
   const patternsKnownReady = summary.patterns_ready && summary.regions_ready;
   if (patternsKnownReady && !hasRealData) {
-    // Show a "loading" placeholder so previous chromosome's data doesn't show
+    // Athena hasn't propagated yet — clear all stale data so nothing from
+    // a previous chromosome leaks into this chromosome's loading state
+    activePatternItems = [];
+    patternRows.length = 0;
+
     chromosomeSummaries.length = 0;
     chromosomeSummaries.push({
       chromosome: summary.chromosome,
@@ -771,9 +775,9 @@ function applySummary(summary) {
       orfs: "Loading from Athena…",
     });
     renderSummaryCards();
+    renderPatternTable(); // clears badges immediately
     if (!isZoomedIn) {
-      renderSelectedChromosomeVisual();
-      // Set AFTER render — renderSelectedChromosomeVisual overwrites the note text
+      renderSelectedChromosomeVisual(); // re-renders SVG with empty activePatternItems
       if (selectedChromosomeVisualNote) {
         selectedChromosomeVisualNote.textContent =
           "Loading analysis data from Athena — pattern and region windows will appear shortly.";
