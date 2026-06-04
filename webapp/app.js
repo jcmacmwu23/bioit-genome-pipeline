@@ -880,13 +880,17 @@ function attachGenomeTrackEvents(chromosome) {
   selectedChromosomeVisual._lensAbort = lensCtrl;
   const sig = lensCtrl.signal;
 
-  const svg = selectedChromosomeVisual.querySelector("svg");
-  if (!svg || !regionLookup.length) return;
+  if (!regionLookup.length) return;
 
   const IX = 44, IW = 672, IY = 64, IH = 30;
 
+  // Always query the CURRENT svg at event time — a stale closure reference returns
+  // zero bounding rect if innerHTML was replaced, breaking inIdeogram/regionAtClientX
+  function currentSvg() { return selectedChromosomeVisual.querySelector("svg"); }
+
   function regionAtClientX(clientX) {
-    const r = svg.getBoundingClientRect();
+    const s = currentSvg(); if (!s) return regionLookup[0];
+    const r = s.getBoundingClientRect();
     const scale = r.width / 760;
     const frac = Math.max(0, Math.min(1, (clientX - r.left - IX * scale) / (IW * scale)));
     const genomicPos = frac * chrLen;
@@ -901,7 +905,9 @@ function attachGenomeTrackEvents(chromosome) {
   }
 
   function inIdeogram(e) {
-    const r = svg.getBoundingClientRect();
+    const s = currentSvg(); if (!s) return false;
+    const r = s.getBoundingClientRect();
+    if (!r.width) return false;
     const scale = r.width / 760;
     const svgX = (e.clientX - r.left) / scale;
     const svgY = (e.clientY - r.top) / scale;
