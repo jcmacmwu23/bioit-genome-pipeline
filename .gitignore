@@ -1,0 +1,35 @@
+# Build and deployment artifacts
+build/
+dist/
+
+# Terraform state — never commit, contains account IDs and resource ARNs
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Environment and secrets
+*.env
+*.tfvars
+config.js          # contains live API endpoint — use config.js.example instead
+
+# Test output
+test_output/
+test_data/
+*.json.output
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

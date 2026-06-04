@@ -1,0 +1,19 @@
+# Python dependencies for Genome Data Pipeline Lambda
+
+# Core data processing
+pyarrow==12.0.1
+
+# Bioinformatics
+biopython==1.83
+
+# AWS SDK is already included in the Lambda Python runtime.
+# Keeping it out of the layer avoids pushing the zip over Lambda's size limit.
+
+# API requests
+requests==2.31.0
+
+# JSON handling (included in Python but listed for completeness)
+# json - built-in
+
+# For additional genomics processing (optional)
+numpy==1.26.2

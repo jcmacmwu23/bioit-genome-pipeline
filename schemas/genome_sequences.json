@@ -1,0 +1,20 @@
+{
+  "pipeline": "genome-sequences",
+  "description": "FASTA/FASTQ genome sequences parsed by C++ parser",
+  "s3_prefix": "genome_data/",
+  "partition_keys": ["source", "species", "chr", "year", "month"],
+  "format": "parquet",
+  "compression": "snappy",
+  "columns": [
+    {"name": "id",               "type": "string",  "description": "Sequence identifier from FASTA/FASTQ header"},
+    {"name": "description",      "type": "string",  "description": "Full header description text"},
+    {"name": "sequence",         "type": "string",  "description": "DNA/RNA sequence string"},
+    {"name": "length",           "type": "int64",   "description": "Sequence length in base pairs"},
+    {"name": "gc_content",       "type": "double",  "description": "GC percentage (0.0 - 100.0)"},
+    {"name": "base_composition", "type": "struct",  "description": "Per-base counts: A, T, G, C, N"},
+    {"name": "quality",          "type": "string",  "description": "Phred quality scores (FASTQ only, null for FASTA)"}
+  ],
+  "sources": ["ncbi", "ensembl", "url"],
+  "owner": "bioapi-pipeline",
+  "version": "1.0"
+}

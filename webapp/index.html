@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BioIT Genome Intelligence Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">BioIT Genome Intelligence</p>
+          <h1>AWS data lake pipeline for human genome analysis.</h1>
+          <p class="hero-text">
+            An end-to-end data pipeline that pulls chromosome sequences from the NCBI API,
+            processes them through a high-performance C++ FASTA parser running on Lambda and
+            AWS Batch, and lands Parquet datasets in an S3 data lake — queryable via Athena
+            and visualized here.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#overview">Open Overview</a>
+            <a class="button button-secondary" href="#controls">Job Controls</a>
+          </div>
+        </div>
+        <aside class="hero-panel">
+          <div class="hero-panel-grid">
+            <article class="metric-card">
+              <span class="metric-label">Chromosomes Ready</span>
+              <strong id="readyChromosomes">2 / 24</strong>
+              <span class="metric-detail">Sequences currently landed in S3</span>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Queue Backlog</span>
+              <strong id="queueDepth">22 pending</strong>
+              <span class="metric-detail">Needs live API wiring</span>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Pattern Dataset</span>
+              <strong>Active</strong>
+              <span class="metric-detail">Motifs, repeats, candidate ORFs</span>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Region Dataset</span>
+              <strong>Athena Ready</strong>
+              <span class="metric-detail">GC, repeats, ORF windows</span>
+            </article>
+          </div>
+        </aside>
+      </header>
+
+      <main class="content">
+        <section class="panel" id="overview">
+          <div class="section-header">
+            <div>
+              <p class="section-kicker">Overview</p>
+              <h2>Analysis-first dashboard layout</h2>
+            </div>
+            <p class="section-copy">
+              The main page should summarize what the C++ analysis layer discovered and make
+              job submission a supporting function rather than the headline feature.
+            </p>
+          </div>
+
+          <div class="overview-grid">
+            <article class="card">
+              <h3>Pipeline health</h3>
+              <dl class="stat-list">
+                <div><dt>Queue depth</dt><dd>22</dd></div>
+                <div><dt>DLQ depth</dt><dd>0</dd></div>
+                <div><dt>Datasets online</dt><dd>3</dd></div>
+                <div><dt>Athena database</dt><dd>genome_pipeline_db</dd></div>
+              </dl>
+            </article>
+
+            <article class="card">
+              <h3>Analysis surface</h3>
+              <ul class="feature-list">
+                <li>Sequence summaries from `genome_sequences`</li>
+                <li>Motif, repeat, and ORF hits from `sequence_patterns`</li>
+                <li>Window-level charts from `sequence_regions`</li>
+              </ul>
+            </article>
+
+            <article class="card">
+              <h3>Dashboard sections</h3>
+              <ul class="feature-list">
+                <li>Chromosome overview cards</li>
+                <li>Pattern leaderboard</li>
+                <li>Candidate coding regions</li>
+                <li>GC / repeat density visualizations</li>
+              </ul>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel" id="chromosomes">
+          <div class="section-header">
+            <div>
+              <p class="section-kicker">Chromosomes</p>
+              <h2>Completion map and per-chromosome summaries</h2>
+            </div>
+            <p class="section-copy">
+              This section is where the app should show which chromosomes are complete and
+              surface small, comparable summary cards backed by Athena.
+            </p>
+          </div>
+
+          <div class="selection-banner">
+            <span class="selection-label">Selected chromosome</span>
+            <strong id="selectedChromosomeLabel">22</strong>
+            <span id="selectedChromosomeStatus" class="selection-status">Loading live analysis</span>
+          </div>
+
+          <div class="selection-meta">
+            <article class="selection-card">
+              <span class="metric-label">Sequence Status</span>
+              <strong id="selectedSequenceStatus">Ready</strong>
+              <span id="selectedSequenceDetail" class="metric-detail">Latest sequence output available</span>
+            </article>
+            <article class="selection-card">
+              <span class="metric-label">Pattern Status</span>
+              <strong id="selectedPatternStatus">Ready</strong>
+              <span id="selectedPatternDetail" class="metric-detail">Pattern leaderboard can be queried</span>
+            </article>
+            <article class="selection-card">
+              <span class="metric-label">Region Status</span>
+              <strong id="selectedRegionStatus">Ready</strong>
+              <span id="selectedRegionDetail" class="metric-detail">GC and ORF windows are available</span>
+            </article>
+            <article class="selection-card">
+              <span class="metric-label">Full Analysis Path</span>
+              <strong id="selectedFullAnalysisStatus">Eligible</strong>
+              <span id="selectedFullAnalysisDetail" class="metric-detail">Current Lambda size budget can support this chromosome.</span>
+            </article>
+          </div>
+
+          <div class="selection-actions">
+            <button id="runFullAnalysisButton" class="button button-primary" type="button">
+              Run Full Analysis
+            </button>
+            <span id="runFullAnalysisHint" class="selection-status">
+              Use this when sequence data is landed and you want patterns plus region summaries.
+            </span>
+          </div>
+
+          <div class="chromosome-layout">
+            <article class="card">
+              <h3>Completion map</h3>
+              <div id="chromosomeGrid" class="chromosome-grid"></div>
+            </article>
+
+            <article class="card">
+              <h3>Example summary cards</h3>
+              <div id="summaryCards" class="summary-cards"></div>
+            </article>
+          </div>
+
+          <div class="visual-layout">
+            <article class="card visual-card">
+              <h3>Chromosome atlas</h3>
+              <p class="card-caption">
+                Ideogram-style atlas scaled by chromosome length, with the selected chromosome
+                highlighted and completed outputs marked as ready.
+              </p>
+              <div id="chromosomeAtlas" class="visual-stage"></div>
+            </article>
+
+            <article class="card visual-card">
+              <h3>Selected chromosome lens</h3>
+              <p class="card-caption">
+                A focused ideogram plus an analysis window track built from the current
+                region-level outputs for the selected chromosome.
+              </p>
+              <div id="selectedChromosomeVisual" class="visual-stage visual-stage-focus"></div>
+              <p id="selectedChromosomeVisualNote" class="chart-note">
+                Load a chromosome to inspect its ideogram and region-level analysis windows.
+              </p>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel" id="analysis">
+          <div class="section-header">
+            <div>
+              <p class="section-kicker">Analysis</p>
+              <h2>C++ results to highlight</h2>
+            </div>
+            <p class="section-copy">
+              These are the highest-value widgets for the first live dashboard page.
+            </p>
+          </div>
+
+          <div class="analysis-grid">
+            <article class="card">
+              <h3>Pattern leaderboard</h3>
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Pattern</th>
+                    <th>Type</th>
+                    <th>Hits</th>
+                  </tr>
+                </thead>
+                <tbody id="patternTable"></tbody>
+              </table>
+            </article>
+
+            <article class="card">
+              <h3>Candidate coding regions</h3>
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Window</th>
+                    <th>GC %</th>
+                    <th>ORFs</th>
+                  </tr>
+                </thead>
+                <tbody id="orfTable"></tbody>
+              </table>
+            </article>
+
+            <article class="card">
+              <h3>Region chart preview</h3>
+              <div class="chart-card">
+                <div id="gcBars" class="bar-chart"></div>
+                <p class="chart-note">
+                  GC-content windows for the selected chromosome.
+                </p>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel" id="controls">
+          <div class="section-header">
+            <div>
+              <p class="section-kicker">Controls</p>
+              <h2>Safe job submission stays available</h2>
+            </div>
+            <p class="section-copy">
+              Job controls belong in the product, but they should support the dashboard rather
+              than dominate it.
+            </p>
+          </div>
+
+          <div class="controls-grid">
+            <form id="singleJobForm" class="card form-card">
+              <h3>Single chromosome</h3>
+              <label>
+                Source
+                <select name="source">
+                  <option value="ncbi">NCBI</option>
+                  <option value="ensembl">Ensembl</option>
+                </select>
+              </label>
+              <label>
+                Accession ID
+                <input name="accessionId" value="NC_000022.11" />
+              </label>
+              <label>
+                Chromosome
+                <input name="chromosome" value="22" />
+              </label>
+              <label>
+                Species
+                <input name="species" value="homo_sapiens" />
+              </label>
+              <label>
+                Output label
+                <input name="outputPrefix" value="human_genome/chr22" />
+              </label>
+              <button class="button button-primary" type="submit">Prepare API submission</button>
+            </form>
+
+            <div class="card">
+              <h3>Full human reference</h3>
+              <p>
+                Submit `1-22`, `X`, and `Y` through one validated backend route that builds
+                message bodies server-side.
+              </p>
+              <button id="submitBatchButton" class="button button-secondary" type="button">
+                Prepare full batch request
+              </button>
+              <ul class="pill-list">
+                <li>24 validated chromosome messages</li>
+                <li>No hand-built shell JSON</li>
+                <li>Cleaner retries and audit logging</li>
+              </ul>
+            </div>
+
+            <div class="card">
+              <h3>Payload preview</h3>
+              <pre id="payloadPreview"></pre>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="./config.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

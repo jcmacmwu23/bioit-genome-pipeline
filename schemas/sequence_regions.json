@@ -1,0 +1,24 @@
+{
+  "pipeline": "sequence-regions",
+  "description": "Sliding-window chromosome region summaries for visualization and hotspot analysis",
+  "s3_prefix": "region_data/",
+  "partition_keys": ["source", "species", "chr", "year", "month"],
+  "format": "parquet",
+  "compression": "snappy",
+  "columns": [
+    {"name": "sequence_id", "type": "string", "description": "Parent FASTA/FASTQ record identifier"},
+    {"name": "region_type", "type": "string", "description": "Region summary type"},
+    {"name": "window_start", "type": "int64", "description": "Zero-based inclusive window start"},
+    {"name": "window_end", "type": "int64", "description": "Zero-based exclusive window end"},
+    {"name": "length", "type": "int64", "description": "Window length in base pairs"},
+    {"name": "gc_content", "type": "double", "description": "Window GC percentage"},
+    {"name": "n_content", "type": "double", "description": "Window ambiguous-base percentage"},
+    {"name": "gc_skew", "type": "double", "description": "Window GC skew"},
+    {"name": "motif_hits", "type": "int64", "description": "Count of motif hits overlapping the window"},
+    {"name": "orf_count", "type": "int64", "description": "Count of candidate ORFs overlapping the window"},
+    {"name": "repeat_bases", "type": "int64", "description": "Total repeat bases overlapping the window"},
+    {"name": "max_homopolymer_run", "type": "int64", "description": "Longest homopolymer run inside the window"}
+  ],
+  "owner": "bioapi-pipeline",
+  "version": "1.0"
+}

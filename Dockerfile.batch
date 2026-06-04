@@ -1,0 +1,22 @@
+FROM public.ecr.aws/docker/library/python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt lambda_handler.py batch_entrypoint.py fasta_parser.cpp /app/
+
+RUN mkdir -p /tmp/json/nlohmann /opt/bin \
+    && curl -fsSL https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp \
+        -o /tmp/json/nlohmann/json.hpp \
+    && g++ -O3 -std=c++17 -I/tmp/json fasta_parser.cpp -o /opt/bin/fasta_parser \
+    && chmod +x /opt/bin/fasta_parser \
+    && python -m pip install --no-cache-dir boto3 -r requirements.txt \
+    && rm -rf /tmp/json
+
+ENTRYPOINT ["python", "/app/batch_entrypoint.py"]

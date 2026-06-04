@@ -1,0 +1,24 @@
+{
+  "pipeline": "gene-annotations",
+  "description": "Known Ensembl gene annotations aligned to chromosome coordinates for hover labels and overlap joins",
+  "s3_prefix": "gene_annotation_data/",
+  "partition_keys": ["source", "species", "chr", "year", "month"],
+  "format": "parquet",
+  "compression": "snappy",
+  "columns": [
+    {"name": "gene_id", "type": "string", "description": "Stable gene identifier from Ensembl"},
+    {"name": "gene_symbol", "type": "string", "description": "Primary display symbol for the gene"},
+    {"name": "gene_name", "type": "string", "description": "Long-form gene or protein name"},
+    {"name": "feature_type", "type": "string", "description": "Annotation feature type, typically gene"},
+    {"name": "biotype", "type": "string", "description": "Ensembl biotype such as protein_coding or lncRNA"},
+    {"name": "start", "type": "int64", "description": "One-based inclusive gene start coordinate"},
+    {"name": "end", "type": "int64", "description": "One-based inclusive gene end coordinate"},
+    {"name": "length", "type": "int64", "description": "Gene span in base pairs"},
+    {"name": "strand", "type": "string", "description": "Gene strand orientation"},
+    {"name": "assembly_name", "type": "string", "description": "Assembly name returned by Ensembl"},
+    {"name": "source_name", "type": "string", "description": "Annotation source used to fetch the record"},
+    {"name": "version", "type": "string", "description": "Annotation version if provided by the source"}
+  ],
+  "owner": "bioapi-pipeline",
+  "version": "1.0"
+}

@@ -1,0 +1,21 @@
+{
+  "pipeline": "sequence-patterns",
+  "description": "Motif, repeat, and candidate ORF hits derived from chromosome sequences",
+  "s3_prefix": "pattern_data/",
+  "partition_keys": ["source", "species", "chr", "year", "month"],
+  "format": "parquet",
+  "compression": "snappy",
+  "columns": [
+    {"name": "sequence_id", "type": "string", "description": "Parent FASTA/FASTQ record identifier"},
+    {"name": "pattern_type", "type": "string", "description": "Pattern family: motif, repeat, or orf"},
+    {"name": "pattern_name", "type": "string", "description": "Specific pattern label"},
+    {"name": "start", "type": "int64", "description": "Zero-based inclusive start coordinate"},
+    {"name": "end", "type": "int64", "description": "Zero-based exclusive end coordinate"},
+    {"name": "length", "type": "int64", "description": "Hit length in base pairs"},
+    {"name": "strand", "type": "string", "description": "Strand orientation used for the hit"},
+    {"name": "score", "type": "double", "description": "Simple numeric score for ranking hits"},
+    {"name": "matched_sequence", "type": "string", "description": "Matched nucleotide sequence snippet"}
+  ],
+  "owner": "bioapi-pipeline",
+  "version": "1.0"
+}
