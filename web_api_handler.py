@@ -19,12 +19,53 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
+import time as _time
+
 s3_client = boto3.client("s3")
 sqs_client = boto3.client("sqs")
 logs_client = boto3.client("logs")
 sts_client = boto3.client("sts")
 athena_client = boto3.client("athena")
 batch_client = boto3.client("batch")
+ddb_client = boto3.client("dynamodb")
+
+CACHE_TABLE = os.environ.get("CACHE_TABLE", "genome-pipeline-cache")
+
+
+def cache_get(key: str) -> Optional[Dict]:
+    """Read a cached API response from DynamoDB. Returns parsed dict or None."""
+    try:
+        resp = ddb_client.get_item(TableName=CACHE_TABLE, Key={"pk": {"S": key}})
+        item = resp.get("Item")
+        if item and "data" in item:
+            return json.loads(item["data"]["S"])
+    except Exception as exc:
+        logger.debug("DynamoDB cache miss or error for %s: %s", key, exc)
+    return None
+
+
+def cache_put(key: str, data: Dict, ttl_seconds: int = 3600) -> None:
+    """Write an API response to DynamoDB with a TTL. Fire-and-forget."""
+    try:
+        ddb_client.put_item(
+            TableName=CACHE_TABLE,
+            Item={
+                "pk": {"S": key},
+                "data": {"S": json.dumps(data)},
+                "ttl": {"N": str(int(_time.time()) + ttl_seconds)},
+            },
+        )
+    except Exception as exc:
+        logger.warning("DynamoDB cache write failed for %s: %s", key, exc)
+
+
+def cache_delete(keys: List[str]) -> None:
+    """Delete one or more cache entries (e.g. after new analysis data lands)."""
+    for key in keys:
+        try:
+            ddb_client.delete_item(TableName=CACHE_TABLE, Key={"pk": {"S": key}})
+        except Exception as exc:
+            logger.warning("DynamoDB cache delete failed for %s: %s", key, exc)
 
 
 DATASET_PREFIXES = {
@@ -1006,36 +1047,56 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
         return json_response(200, {"ok": True})
 
     if method == "GET" and path.endswith("/api/status/overview"):
-        return json_response(200, build_overview(), cache_seconds=30)
+        cached = cache_get("OVERVIEW")
+        if cached:
+            return json_response(200, cached, cache_seconds=30)
+        data = build_overview()
+        cache_put("OVERVIEW", data, ttl_seconds=30)
+        return json_response(200, data, cache_seconds=30)
 
     if method == "GET" and path.endswith("/api/chromosomes"):
-        return json_response(200, {"items": build_chromosome_inventory()}, cache_seconds=120)
+        cached = cache_get("CHROMOSOMES")
+        if cached:
+            return json_response(200, cached, cache_seconds=120)
+        data = {"items": build_chromosome_inventory()}
+        cache_put("CHROMOSOMES", data, ttl_seconds=120)
+        return json_response(200, data, cache_seconds=120)
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/summary"):
         chromosome = path.rstrip("/").split("/")[-2]
-        return json_response(200, build_chromosome_summary(chromosome), cache_seconds=300)
+        ck = f"CHR#{safe_chromosome(chromosome)}#SUMMARY"
+        cached = cache_get(ck)
+        if cached:
+            return json_response(200, cached, cache_seconds=300)
+        data = build_chromosome_summary(chromosome)
+        cache_put(ck, data, ttl_seconds=300)
+        return json_response(200, data, cache_seconds=300)
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/patterns"):
         chromosome = path.rstrip("/").split("/")[-2]
-        return json_response(
-            200,
-            {
-                "chromosome": safe_chromosome(chromosome),
-                "items": get_chromosome_pattern_rows(chromosome),
-            },
-            cache_seconds=3600,
-        )
+        ck = f"CHR#{safe_chromosome(chromosome)}#PATTERNS"
+        cached = cache_get(ck)
+        if cached:
+            return json_response(200, cached, cache_seconds=3600)
+        data = {
+            "chromosome": safe_chromosome(chromosome),
+            "items": get_chromosome_pattern_rows(chromosome),
+        }
+        cache_put(ck, data, ttl_seconds=3600)
+        return json_response(200, data, cache_seconds=3600)
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/regions"):
         chromosome = path.rstrip("/").split("/")[-2]
-        return json_response(
-            200,
-            {
-                "chromosome": safe_chromosome(chromosome),
-                "items": get_chromosome_region_rows(chromosome),
-            },
-            cache_seconds=3600,
-        )
+        ck = f"CHR#{safe_chromosome(chromosome)}#REGIONS"
+        cached = cache_get(ck)
+        if cached:
+            return json_response(200, cached, cache_seconds=3600)
+        data = {
+            "chromosome": safe_chromosome(chromosome),
+            "items": get_chromosome_region_rows(chromosome),
+        }
+        cache_put(ck, data, ttl_seconds=3600)
+        return json_response(200, data, cache_seconds=3600)
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/orfs"):
         chromosome = path.rstrip("/").split("/")[-2]

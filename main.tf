@@ -224,6 +224,11 @@ resource "aws_iam_role_policy" "lambda_policy" {
         Resource = "*"
       },
       {
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:BatchWriteItem"]
+        Resource = aws_dynamodb_table.api_cache.arn
+      },
+      {
         Effect = "Allow"
         Action = [
           "s3:GetObject",
@@ -279,6 +284,7 @@ resource "aws_lambda_function" "genome_processor" {
       ATHENA_WORKGROUP       = aws_athena_workgroup.genome_workgroup.name
       ATHENA_RESULTS_BUCKET  = aws_s3_bucket.athena_results.id
       API_CF_DISTRIBUTION_ID = aws_cloudfront_distribution.api.id
+      CACHE_TABLE            = aws_dynamodb_table.api_cache.name
     }
   }
 
@@ -482,7 +488,8 @@ resource "aws_batch_job_definition" "full_analysis" {
       { name = "ATHENA_DATABASE",        value = aws_glue_catalog_database.genome_db.name },
       { name = "ATHENA_WORKGROUP",       value = aws_athena_workgroup.genome_workgroup.name },
       { name = "ATHENA_RESULTS_BUCKET",  value = aws_s3_bucket.athena_results.id },
-      { name = "API_CF_DISTRIBUTION_ID", value = aws_cloudfront_distribution.api.id }
+      { name = "API_CF_DISTRIBUTION_ID", value = aws_cloudfront_distribution.api.id },
+      { name = "CACHE_TABLE",            value = aws_dynamodb_table.api_cache.name }
     ]
   })
 }
@@ -611,6 +618,11 @@ resource "aws_iam_role_policy" "web_api_policy" {
           "lakeformation:GetDataAccess"
         ]
         Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:BatchWriteItem"]
+        Resource = aws_dynamodb_table.api_cache.arn
       }
     ]
   })
@@ -639,6 +651,7 @@ resource "aws_lambda_function" "web_api" {
       ATHENA_RESULTS_BUCKET = aws_s3_bucket.athena_results.id
       BATCH_JOB_QUEUE       = aws_batch_job_queue.full_analysis.arn
       BATCH_JOB_DEFINITION  = aws_batch_job_definition.full_analysis.arn
+      CACHE_TABLE           = aws_dynamodb_table.api_cache.name
     }
   }
 
@@ -719,6 +732,25 @@ resource "aws_lambda_permission" "allow_apigw_dashboard_api" {
   function_name = aws_lambda_function.web_api.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.dashboard_api.execution_arn}/*/*"
+}
+
+# ── DynamoDB cache table ─────────────────────────────────────────────────────
+resource "aws_dynamodb_table" "api_cache" {
+  name         = "${var.project_name}-cache"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = { Name = "${var.project_name}-api-cache" }
 }
 
 # Static website hosting for dashboard

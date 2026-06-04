@@ -21,12 +21,14 @@ s3_client = boto3.client('s3')
 sqs_client = boto3.client('sqs')
 athena_client = boto3.client('athena')
 sts_client = boto3.client('sts')
+ddb_client = boto3.client('dynamodb')
 
 # Environment variables
 OUTPUT_BUCKET = os.environ.get('OUTPUT_BUCKET')
 ATHENA_DATABASE = os.environ.get('ATHENA_DATABASE', 'genome_pipeline_db')
 ATHENA_WORKGROUP = os.environ.get('ATHENA_WORKGROUP', 'genome-pipeline-workgroup')
 ATHENA_RESULTS_BUCKET = os.environ.get('ATHENA_RESULTS_BUCKET')
+CACHE_TABLE = os.environ.get('CACHE_TABLE')
 CPP_PARSER_PATH = '/opt/bin/fasta_parser'  # C++ binary in Lambda layer
 DATASET_PREFIXES = {
     'sequences': 'genome_data',
@@ -73,7 +75,27 @@ def trigger_partition_repair(uploaded_dataset_keys: List[str], chromosome: Optio
             except Exception as exc:
                 logger.warning(f"MSCK REPAIR could not start for {table}: {exc}")
 
-        # 2. CloudFront cache invalidation so the dashboard sees fresh data immediately
+        # 2. DynamoDB cache invalidation — delete stale entries for this chromosome
+        if CACHE_TABLE and chromosome:
+            chr_upper = chromosome.upper() if chromosome.lower() in ('x', 'y') else chromosome
+            keys_to_delete = [
+                f"CHR#{chr_upper}#SUMMARY",
+                f"CHR#{chr_upper}#PATTERNS",
+                f"CHR#{chr_upper}#REGIONS",
+                "CHROMOSOMES",
+                "OVERVIEW",
+            ]
+            for key in keys_to_delete:
+                try:
+                    ddb_client.delete_item(
+                        TableName=CACHE_TABLE,
+                        Key={"pk": {"S": key}},
+                    )
+                except Exception as exc:
+                    logger.warning(f"DynamoDB cache delete failed for {key}: {exc}")
+            logger.info(f"DynamoDB cache cleared for chr{chromosome}")
+
+        # 3. CloudFront cache invalidation so the dashboard sees fresh data immediately
         cf_distribution_id = os.environ.get('API_CF_DISTRIBUTION_ID')
         if cf_distribution_id and chromosome:
             try:
