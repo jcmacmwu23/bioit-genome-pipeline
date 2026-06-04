@@ -623,6 +623,11 @@ resource "aws_iam_role_policy" "web_api_policy" {
         Effect   = "Allow"
         Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:BatchWriteItem"]
         Resource = aws_dynamodb_table.api_cache.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["cloudfront:CreateInvalidation"]
+        Resource = "*"
       }
     ]
   })
