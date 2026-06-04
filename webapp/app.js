@@ -744,6 +744,7 @@ function renderGcBars() {
 
 function applySummary(summary) {
   activeSummary = summary;
+  // Always update the inventory (drives status cards and eligibility)
   chromosomeInventory.set(summary.chromosome, {
     ...chromosomeState(summary.chromosome),
     sequenceLength: summary.sequence_length,
@@ -753,6 +754,17 @@ function applySummary(summary) {
     fullAnalysisReason: summary.full_analysis_reason,
     fullAnalysisMaxBases: summary.full_analysis_max_bases,
   });
+
+  // Skip the summary card if patterns are marked ready but count is 0 —
+  // this means Athena MSCK propagation hasn't finished yet. Keep showing
+  // the previous card data instead of overwriting with stale zeros.
+  const hasRealData = summary.pattern_hit_count && summary.pattern_hit_count !== "0";
+  const patternsKnownReady = summary.patterns_ready && summary.regions_ready;
+  if (patternsKnownReady && !hasRealData) {
+    if (!isZoomedIn) renderSelectedChromosomeVisual();
+    return;
+  }
+
   chromosomeSummaries.length = 0;
   chromosomeSummaries.push({
     chromosome: summary.chromosome,
