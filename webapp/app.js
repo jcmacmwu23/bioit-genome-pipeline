@@ -9,15 +9,7 @@ const chromosomeStatus = [
   regionsReady: chromosome === "22" || chromosome === "Y",
 }));
 
-const chromosomeSummaries = [
-  {
-    chromosome: "22",
-    length: "50.8M bp",
-    gc: "36.2%",
-    patterns: "analysis ready",
-    orfs: "candidate ORFs detected",
-  },
-];
+const chromosomeSummaries = [];
 
 const patternRows = [
   { name: "CpG-like motif", type: "motif", hits: 1482 },
@@ -302,6 +294,32 @@ function setSelectedChromosome(chromosome) {
   renderSelectedChromosomeVisual();
 }
 
+function buildOverviewRegionSample(items, maxCount = 72) {
+  const sorted = items
+    .slice()
+    .sort((a, b) => Number(a.window_start || 0) - Number(b.window_start || 0));
+
+  if (sorted.length <= maxCount) {
+    return sorted;
+  }
+
+  const sample = [];
+  const seenStarts = new Set();
+  const step = (sorted.length - 1) / (maxCount - 1);
+
+  for (let index = 0; index < maxCount; index += 1) {
+    const picked = sorted[Math.round(index * step)];
+    const start = Number(picked.window_start || 0);
+    if (seenStarts.has(start)) {
+      continue;
+    }
+    seenStarts.add(start);
+    sample.push(picked);
+  }
+
+  return sample;
+}
+
 function selectedChromosomeMessage(item) {
   if (item.ready && item.patternsReady && item.regionsReady) {
     return "Live sequence, pattern, and region analysis loaded";
@@ -482,7 +500,7 @@ function renderSelectedChromosomeVisual() {
   const item = chromosomeState(activeChromosome);
   const length = chromosomeLengthValue(activeChromosome);
   const patterns = activePatternItems.slice(0, 3);
-  const regions = activeRegionItems.slice(0, 24);
+  const regions = buildOverviewRegionSample(activeRegionItems);
   const width = 760;
   const height = 456;
   const ideogramX = 44;
@@ -492,11 +510,11 @@ function renderSelectedChromosomeVisual() {
   const clipId = `focus-clip-${activeChromosome}`;
   const orfBands = buildOrfDensityBands(activeRegionItems, length);
   const bands = orfBands || buildChromosomeBands(activeChromosome);
-  const maxWindowEnd = regions.length
-    ? Math.max(...regions.map((region) => Number(region.window_end || 0)))
+  const maxWindowEnd = activeRegionItems.length
+    ? Math.max(...activeRegionItems.map((region) => Number(region.window_end || 0)))
     : 0;
-  const minWindowStart = regions.length
-    ? Math.min(...regions.map((region) => Number(region.window_start || 0)))
+  const minWindowStart = activeRegionItems.length
+    ? Math.min(...activeRegionItems.map((region) => Number(region.window_start || 0)))
     : 0;
   const trackX = 44;
   const trackY = 196;
@@ -551,13 +569,13 @@ function renderSelectedChromosomeVisual() {
       const motifHits = Number(region.motif_hits || 0);
       const orfCount = Number(region.orf_count || 0);
       const repeatBases = Number(region.repeat_bases || 0);
-      const regionX = trackX + ((start - minWindowStart) / (maxWindowEnd - minWindowStart || 1)) * trackWidth;
-      const regionWidth = Math.max(14, ((end - start) / (maxWindowEnd - minWindowStart || 1)) * trackWidth);
+      const regionX = trackX + (start / Math.max(length, 1)) * trackWidth;
+      const regionWidth = Math.max(6, ((end - start) / Math.max(length, 1)) * trackWidth);
       const columnHeight = 18 + (gc * 1.1);
       const regionY = trackY + trackHeight - columnHeight - 14;
       const labelY = trackY + trackHeight - 4;
 
-      svgParts.push(`<rect x="${regionX}" y="${regionY}" width="${regionWidth}" height="${columnHeight}" rx="8" fill="${gcColor(gc)}" opacity="0.88" />`);
+      svgParts.push(`<rect x="${regionX}" y="${regionY}" width="${regionWidth}" height="${columnHeight}" rx="8" fill="${gcColor(gc)}" opacity="0.88" class="region-window" style="cursor:pointer" data-wstart="${start}" data-wend="${end}" data-orf="${orfCount}" data-motif="${motifHits}" data-gc="${gc.toFixed(2)}" />`);
 
       if (motifHits > 0) {
         svgParts.push(`<circle cx="${regionX + regionWidth / 2}" cy="${regionY - 8}" r="${Math.min(6, 2 + motifHits / 2)}" fill="#bf5f2f" opacity="0.78" />`);
@@ -570,7 +588,7 @@ function renderSelectedChromosomeVisual() {
         svgParts.push(`<line x1="${flagX}" y1="${flagY - 2}" x2="${flagX}" y2="${regionY}" stroke="${SELECTED_ACCENT}" stroke-width="1.2" />`);
       }
 
-      if (index < 4) {
+      if (index < 5) {
         svgParts.push(`<text x="${regionX + regionWidth / 2}" y="${labelY}" text-anchor="middle" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">${(start / 1000000).toFixed(1)}</text>`);
       }
 
@@ -627,7 +645,7 @@ function renderSelectedChromosomeVisual() {
 
   const firstRegion = regions[0];
   const lastRegion = regions[regions.length - 1];
-  selectedChromosomeVisualNote.textContent = `The lower lens covers ${formatWindowRange(Number(firstRegion.window_start || 0), Number(lastRegion.window_end || 0))} with GC-colored windows, motif markers, ORF flags, and repeat-density tags for chromosome ${activeChromosome}.`;
+  selectedChromosomeVisualNote.textContent = `The lower lens samples ${regions.length.toLocaleString()} region windows across ${formatWindowRange(Number(firstRegion.window_start || 0), Number(lastRegion.window_end || 0))} for chromosome ${activeChromosome}. Click the ideogram or CpG density track to zoom into a local segment.`;
 }
 
 function applyChromosomeInventory(items) {
@@ -742,6 +760,47 @@ function renderGcBars() {
   });
 }
 
+function showSummaryLoadingState(chromosome, message = "Loading…") {
+  const item = chromosomeState(chromosome);
+  chromosomeSummaries.length = 0;
+  chromosomeSummaries.push({
+    chromosome,
+    length: item.sequenceLength ? `${Number(item.sequenceLength).toLocaleString()} bp` : "Loading…",
+    gc: item.avgGcContent ? `${item.avgGcContent}%` : message,
+    patterns: message,
+    orfs: message,
+  });
+  renderSummaryCards();
+}
+
+function showAthenaLoadingLabel(percent, phase = "Loading from Athena") {
+  const pct = Math.max(1, Math.min(99, Math.round(Number(percent) || 0)));
+  return `${phase}… ${pct}%`;
+}
+
+function showAthenaLoadingState(
+  chromosome,
+  item = chromosomeState(chromosome),
+  percent = 92,
+  phase = "Loading from Athena",
+) {
+  const loadingLabel = showAthenaLoadingLabel(percent, phase);
+  chromosomeSummaries.length = 0;
+  chromosomeSummaries.push({
+    chromosome,
+    length: item && item.sequenceLength ? `${Number(item.sequenceLength).toLocaleString()} bp` : "n/a",
+    gc: item && item.avgGcContent ? `${item.avgGcContent}%` : "n/a",
+    patterns: loadingLabel,
+    orfs: loadingLabel,
+  });
+  renderSummaryCards();
+
+  if (selectedChromosomeVisualNote && chromosome === activeChromosome) {
+    selectedChromosomeVisualNote.textContent =
+      `${loadingLabel} for chromosome ${chromosome} — pattern and region windows will appear shortly.`;
+  }
+}
+
 function applySummary(summary) {
   activeSummary = summary;
   // Always update the inventory (drives status cards and eligibility)
@@ -765,22 +824,14 @@ function applySummary(summary) {
     activePatternItems = [];
     patternRows.length = 0;
 
-    chromosomeSummaries.length = 0;
-    chromosomeSummaries.push({
-      chromosome: summary.chromosome,
-      length: summary.sequence_length ? `${Number(summary.sequence_length).toLocaleString()} bp` : "n/a",
-      gc: summary.avg_gc_content ? `${summary.avg_gc_content}%` : "n/a",
-      patterns: "Loading from Athena…",
-      orfs: "Loading from Athena…",
-    });
-    renderSummaryCards();
+    showAthenaLoadingState(summary.chromosome, {
+      ...chromosomeState(summary.chromosome),
+      sequenceLength: summary.sequence_length,
+      avgGcContent: summary.avg_gc_content,
+    }, 96);
     renderPatternTable();
     if (!isZoomedIn) {
       renderSelectedChromosomeVisual();
-      if (selectedChromosomeVisualNote) {
-        selectedChromosomeVisualNote.textContent =
-          "Loading analysis data from Athena — pattern and region windows will appear shortly.";
-      }
     }
 
     // Auto-trigger /sync so Glue partition + cache are fixed automatically
@@ -906,22 +957,48 @@ function attachGenomeTrackEvents(chromosome) {
     .map(r => ({ ws: +r.window_start, we: +r.window_end, orf: +r.orf_count || 0, motif: +r.motif_hits || 0, gc: +r.gc_content || 0 }))
     .sort((a, b) => a.ws - b.ws);
 
-  // CpG density bands — hover tooltip + click-to-zoom (these are full-width, reliable targets)
-  selectedChromosomeVisual.querySelectorAll(".cpg-band").forEach((el) => {
-    el.style.cursor = "pointer";
-    el.addEventListener("mouseenter", (e) => {
-      tip.innerHTML = `<strong>${formatCoord(+el.dataset.wstart)} – ${formatCoord(+el.dataset.wend)}</strong><br>CpG hits: <b>${el.dataset.motif}</b><br><small style="color:#0d9488">Click to zoom</small>`;
-      tip.style.display = "block";
-      moveTip(e);
+  function attachRegionTarget(selector, tooltipHtml, zoomMultiplier = 1) {
+    selectedChromosomeVisual.querySelectorAll(selector).forEach((el) => {
+      el.style.cursor = "pointer";
+      el.addEventListener("mouseenter", (e) => {
+        tip.innerHTML = tooltipHtml(el);
+        tip.style.display = "block";
+        moveTip(e);
+      });
+      el.addEventListener("mousemove", moveTip);
+      el.addEventListener("mouseleave", hideTip);
+      el.addEventListener("click", (e) => {
+        e.stopPropagation();
+        hideTip();
+        const ws = +el.dataset.wstart;
+        const we = +el.dataset.wend;
+        const span = Math.max(1, we - ws);
+        zoomToGenomeRegion(
+          chromosome,
+          Math.max(0, ws - span * zoomMultiplier),
+          Math.min(chrLen, we + span * zoomMultiplier),
+        );
+      });
     });
-    el.addEventListener("mousemove", moveTip);
-    el.addEventListener("mouseleave", hideTip);
-    el.addEventListener("click", () => {
-      hideTip();
-      const ws = +el.dataset.wstart, we = +el.dataset.wend, span = we - ws;
-      zoomToGenomeRegion(chromosome, Math.max(0, ws - span), Math.min(chrLen, we + span));
-    });
-  });
+  }
+
+  attachRegionTarget(
+    ".orf-band[data-wstart]",
+    (el) => `<strong>${formatCoord(+el.dataset.wstart)} – ${formatCoord(+el.dataset.wend)}</strong><br>ORFs: <b>${el.dataset.orf}</b> &nbsp;·&nbsp; CpG hits: <b>${el.dataset.motif}</b> &nbsp;·&nbsp; GC: <b>${Number(el.dataset.gc || 0).toFixed(1)}%</b><br><small style="color:#7167c7">Click to zoom</small>`,
+    1,
+  );
+
+  attachRegionTarget(
+    ".region-window",
+    (el) => `<strong>${formatCoord(+el.dataset.wstart)} – ${formatCoord(+el.dataset.wend)}</strong><br>ORFs: <b>${el.dataset.orf}</b> &nbsp;·&nbsp; CpG hits: <b>${el.dataset.motif}</b> &nbsp;·&nbsp; GC: <b>${Number(el.dataset.gc || 0).toFixed(1)}%</b><br><small style="color:#bf5f2f">Click to zoom</small>`,
+    1,
+  );
+
+  attachRegionTarget(
+    ".cpg-band",
+    (el) => `<strong>${formatCoord(+el.dataset.wstart)} – ${formatCoord(+el.dataset.wend)}</strong><br>CpG hits: <b>${el.dataset.motif}</b><br><small style="color:#0d9488">Click to zoom</small>`,
+    1,
+  );
 
   // Use the container div for reliable clicks — abort previous listeners first
   if (selectedChromosomeVisual._lensAbort) selectedChromosomeVisual._lensAbort.abort();
@@ -964,6 +1041,9 @@ function attachGenomeTrackEvents(chromosome) {
   }
 
   selectedChromosomeVisual.addEventListener("mousemove", (e) => {
+    if (e.target && e.target.closest(".orf-band,.region-window,.cpg-band")) {
+      return;
+    }
     if (!inIdeogram(e)) { hideTip(); return; }
     const reg = regionAtClientX(e.clientX);
     if (!reg) return;
@@ -979,6 +1059,9 @@ function attachGenomeTrackEvents(chromosome) {
   }, { signal: sig });
 
   selectedChromosomeVisual.addEventListener("click", (e) => {
+    if (e.target && e.target.closest(".orf-band,.region-window,.cpg-band")) {
+      return;
+    }
     if (!inIdeogram(e)) return;
     hideTip();
     const reg = regionAtClientX(e.clientX);
@@ -1211,8 +1294,16 @@ async function loadChromosomeDetails(chromosome) {
 
   // Clear stale pattern badges from any previous chromosome immediately
   activePatternItems = [];
+  activeRegionItems = [];
+  activeOrfItems = [];
+  activeCpgItems = [];
   patternRows.length = 0;
+  orfRows.length = 0;
+  gcValues.length = 0;
   renderPatternTable();
+  renderOrfTable();
+  renderGcBars();
+  renderSelectedChromosomeVisual();
 
   // Show immediate loading feedback
   selectedChromosomeStatus.textContent = `Loading chromosome ${chromosome} data…`;
@@ -1222,7 +1313,7 @@ async function loadChromosomeDetails(chromosome) {
   const [summary, patterns, regions] = await Promise.all([
     fetchJson(`/api/chromosomes/${chromosome}/summary`).catch(e => { console.warn("summary failed", e); return null; }),
     fetchJson(`/api/chromosomes/${chromosome}/patterns`).catch(e => { console.warn("patterns failed", e); return null; }),
-    fetchJson(`/api/chromosomes/${chromosome}/regions`).catch(e => { console.warn("regions failed", e); return null; }),
+    fetchJson(`/api/chromosomes/${chromosome}/regions?limit=5000`).catch(e => { console.warn("regions failed", e); return null; }),
   ]);
 
   if (!summary && !patterns && !regions) {
@@ -1235,7 +1326,26 @@ async function loadChromosomeDetails(chromosome) {
   // Only replace existing data with non-empty results — empty arrays from Athena cold/miss
   // must not clear a visualization that is already showing correctly
   if (patterns && Array.isArray(patterns.items) && patterns.items.length > 0) applyPatterns(patterns.items);
-  if (regions && Array.isArray(regions.items) && regions.items.length > 0) applyRegions(regions.items);
+  if (regions && Array.isArray(regions.items) && regions.items.length > 0) {
+    applyRegions(regions.items);
+  } else if (summary && Number(summary.pattern_hit_count || 0) > 0) {
+    selectedChromosomeVisualNote.textContent =
+      `Analysis data exists for chromosome ${chromosome}, but region windows have not loaded yet. Retrying sync…`;
+    if (API_BASE_URL && window._regionRepairing !== chromosome) {
+      window._regionRepairing = chromosome;
+      fetch(`${API_BASE_URL}/api/chromosomes/${chromosome}/sync`, { method: "POST" })
+        .then(() => {
+          setTimeout(() => {
+            window._regionRepairing = null;
+            loadChromosomeDetails(chromosome).catch((e) => console.warn("region reload failed", e));
+          }, 4000);
+        })
+        .catch((e) => {
+          window._regionRepairing = null;
+          console.warn("region sync retry failed", e);
+        });
+    }
+  }
 
   renderChromosomeGrid();
   startBatchPollingIfNeeded(chromosome);
@@ -1288,18 +1398,20 @@ async function pollBatchStatus(chromosome) {
     // Stop polling once done or failed
     if (bs.status === "SUCCEEDED" || bs.status === "FAILED" || bs.status === "no_job") {
       stopBatchPolling();
-      if (bs.status === "SUCCEEDED") {
+    if (bs.status === "SUCCEEDED") {
         // Reload chromosome data — results should now be in S3/Athena
         // Trigger MSCK REPAIR + cache clearing — /sync waits for Athena before returning
         // Show progress in the status cards so the user knows what's happening
         const syncMsg = "Syncing Athena partitions… (~30s)";
         if (selectedPatternDetail) selectedPatternDetail.textContent = syncMsg;
         if (selectedRegionDetail) selectedRegionDetail.textContent = syncMsg;
+        showAthenaLoadingState(chromosome, chromosomeState(chromosome), 88, "Syncing Athena");
         if (API_BASE_URL) {
           fetch(`${API_BASE_URL}/api/chromosomes/${chromosome}/sync`, { method: "POST" })
             .then(() => {
               if (selectedPatternDetail) selectedPatternDetail.textContent = "Sync complete — loading results…";
               if (selectedRegionDetail) selectedRegionDetail.textContent = "Sync complete — loading results…";
+              showAthenaLoadingState(chromosome, chromosomeState(chromosome), 95);
               setTimeout(() => hydrateDashboard(), 5000);
             })
             .catch(e => { console.warn("sync failed", e); setTimeout(() => hydrateDashboard(), 10000); });
@@ -1330,8 +1442,14 @@ function handleChromosomeSelection(chromosome) {
   if (zoomAbortController) { zoomAbortController.abort(); zoomAbortController = null; }
   // Clear stale pattern badges from the previous chromosome
   activePatternItems = [];
+  activeRegionItems = [];
   patternRows.length = 0;
+  orfRows.length = 0;
+  gcValues.length = 0;
+  showSummaryLoadingState(chromosome, "Loading…");
   renderPatternTable();
+  renderOrfTable();
+  renderGcBars();
   loadChromosomeDetails(chromosome);
 }
 
@@ -1386,7 +1504,7 @@ runFullAnalysisButton.addEventListener("click", () => {
 });
 
 setSelectedChromosome(activeChromosome);
-renderSummaryCards();
+showSummaryLoadingState(activeChromosome, "Loading…");
 renderPatternTable();
 renderOrfTable();
 renderGcBars();

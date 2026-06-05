@@ -48,32 +48,73 @@ DATASET_TABLE_MAP = {
 }
 
 
-def trigger_partition_repair(uploaded_dataset_keys: List[str], chromosome: Optional[str] = None) -> None:
+def parse_partition_details(dataset_key: str, s3_uri: str) -> Optional[Dict[str, str]]:
     """
-    1. Fire-and-forget MSCK REPAIR TABLE for each updated Glue table.
+    Extract Hive-style partition values and location from an uploaded dataset URI.
+    """
+    dataset_prefix = DATASET_PREFIXES.get(dataset_key)
+    if not dataset_prefix or not s3_uri.startswith('s3://'):
+        return None
+
+    match = re.match(
+        rf"^s3://([^/]+)/({re.escape(dataset_prefix)}/source=([^/]+)/species=([^/]+)/chr=([^/]+)/year=(\d{{4}})/month=(\d{{2}})/)[^/]+$",
+        s3_uri,
+    )
+    if not match:
+        return None
+
+    bucket, location_key, source, species, chromosome, year, month = match.groups()
+    return {
+        'bucket': bucket,
+        'source': source,
+        'species': species,
+        'chromosome': chromosome.upper() if chromosome.lower() in {'x', 'y'} else chromosome,
+        'year': year,
+        'month': month,
+        'location': f"s3://{bucket}/{location_key}",
+    }
+
+
+def trigger_partition_repair(uploaded_outputs: Dict[str, str], chromosome: Optional[str] = None) -> None:
+    """
+    1. Fire-and-forget targeted ALTER TABLE ADD PARTITION statements.
     2. Invalidate CloudFront API cache for the chromosome so stale
        'pending' responses are not served after analysis completes.
     """
-    tables = [DATASET_TABLE_MAP[k] for k in uploaded_dataset_keys if k in DATASET_TABLE_MAP]
-    if not tables:
+    partition_jobs = []
+    for dataset_key, s3_uri in uploaded_outputs.items():
+        table = DATASET_TABLE_MAP.get(dataset_key)
+        partition = parse_partition_details(dataset_key, s3_uri)
+        if not table or not partition:
+            continue
+        partition_jobs.append((table, partition))
+
+    if not partition_jobs:
         return
     try:
         account_id = sts_client.get_caller_identity()['Account']
         results_bucket = ATHENA_RESULTS_BUCKET or f"genome-pipeline-athena-results-{account_id}"
 
-        # 1. MSCK REPAIR (async, no wait)
-        for table in tables:
+        # 1. Targeted partition add (async, no wait)
+        for table, partition in partition_jobs:
             try:
+                sql = (
+                    f"ALTER TABLE {ATHENA_DATABASE}.{table} "
+                    f"ADD IF NOT EXISTS PARTITION "
+                    f"(source='{partition['source']}', species='{partition['species']}', "
+                    f"chr='{partition['chromosome']}', year='{partition['year']}', month='{partition['month']}') "
+                    f"LOCATION '{partition['location']}'"
+                )
                 resp = athena_client.start_query_execution(
-                    QueryString=f"MSCK REPAIR TABLE {ATHENA_DATABASE}.{table}",
+                    QueryString=sql,
                     WorkGroup=ATHENA_WORKGROUP,
                     ResultConfiguration={
                         'OutputLocation': f"s3://{results_bucket}/partition-repair/"
                     },
                 )
-                logger.info(f"MSCK REPAIR started for {table}: {resp['QueryExecutionId']}")
+                logger.info(f"Partition add started for {table}: {resp['QueryExecutionId']}")
             except Exception as exc:
-                logger.warning(f"MSCK REPAIR could not start for {table}: {exc}")
+                logger.warning(f"Partition add could not start for {table}: {exc}")
 
         # 2. DynamoDB cache invalidation — delete stale entries for this chromosome
         if CACHE_TABLE and chromosome:
@@ -822,9 +863,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     'analysis_mode': analysis_mode,
                 })
 
-                # Kick off async Glue partition repair + CloudFront invalidation
+                # Kick off async partition add + cache invalidation
                 trigger_partition_repair(
-                    [k for k in dataset_keys if k in DATASET_TABLE_MAP],
+                    {k: v for k, v in uploaded_outputs.items() if k in DATASET_TABLE_MAP},
                     chromosome=derive_chromosome_label(job_event),
                 )
 

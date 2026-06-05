@@ -424,7 +424,9 @@ class TestWebAPIHandler(unittest.TestCase):
         self.sts_client = MagicMock()
         self.athena_client = MagicMock()
         self.batch_client = MagicMock()
+        self.ddb_client = MagicMock()
         self.sts_client.get_caller_identity.return_value = {'Account': '443568785165'}
+        self.ddb_client.get_item.return_value = {}
 
         client_map = {
             's3': self.s3_client,
@@ -433,6 +435,7 @@ class TestWebAPIHandler(unittest.TestCase):
             'sts': self.sts_client,
             'athena': self.athena_client,
             'batch': self.batch_client,
+            'dynamodb': self.ddb_client,
         }
         self.boto3_module = types.SimpleNamespace(
             client=MagicMock(side_effect=lambda service, **kwargs: client_map[service])
@@ -648,6 +651,49 @@ class TestWebAPIHandler(unittest.TestCase):
         self.assertEqual(body['orf_count'], '11')
         self.assertTrue(body['annotations_ready'])
 
+    def test_chromosome_summary_route_falls_back_when_athena_fails(self):
+        """Summary route should still render inventory-backed status if Athena is unavailable."""
+        from web_api_handler import lambda_handler
+
+        self.athena_client.start_query_execution.side_effect = RuntimeError('athena unavailable')
+
+        with patch('web_api_handler.build_chromosome_inventory') as mock_inventory, patch('web_api_handler.latest_object_for_dataset') as mock_latest:
+            mock_inventory.return_value = [
+                {
+                    'chromosome': '22',
+                    'sequence_ready': True,
+                    'patterns_ready': False,
+                    'regions_ready': False,
+                    'annotations_ready': False,
+                    'latest_output_at': '2026-05-28T03:28:12Z',
+                    'latest_key': 'genome_data/source=ncbi/species=homo_sapiens/chr=22/year=2026/month=05/file.parquet',
+                    'sequence_length': '50818468',
+                    'avg_gc_content': None,
+                    'full_analysis_eligible': True,
+                    'full_analysis_status': 'eligible',
+                    'full_analysis_reason': 'ready',
+                    'full_analysis_max_bases': 60000000,
+                    'full_analysis_backend': 'lambda',
+                }
+            ]
+            mock_latest.side_effect = [None, None, None]
+
+            response = lambda_handler(
+                {
+                    'requestContext': {'http': {'method': 'GET'}},
+                    'rawPath': '/api/chromosomes/22/summary',
+                },
+                None,
+            )
+
+        body = json.loads(response['body'])
+        self.assertEqual(response['statusCode'], 200)
+        self.assertEqual(body['chromosome'], '22')
+        self.assertEqual(body['sequence_length'], '50818468')
+        self.assertEqual(body['pattern_hit_count'], '0')
+        self.assertEqual(body['orf_count'], '0')
+        self.assertIsNone(body['avg_gc_content'])
+
     def test_human_reference_route_defaults_to_sequence_only(self):
         """Human reference route should favor lightweight bulk ingestion."""
         from web_api_handler import lambda_handler
@@ -811,6 +857,57 @@ class TestWebAPIHandler(unittest.TestCase):
         self.assertEqual(body['chromosome'], '22')
         self.assertEqual(len(body['items']), 2)
         self.assertEqual(body['items'][0]['pattern_name'], 'CpG-like motif')
+
+    def test_sync_route_uses_actual_latest_partition_paths(self):
+        """Manual sync should register the partition that really exists in S3."""
+        from web_api_handler import lambda_handler
+
+        self.athena_client.start_query_execution.side_effect = [
+            {'QueryExecutionId': 'sync-1'},
+            {'QueryExecutionId': 'sync-2'},
+        ]
+        self.athena_client.get_query_execution.return_value = {
+            'QueryExecution': {'Status': {'State': 'SUCCEEDED'}}
+        }
+
+        paginator = MagicMock()
+        paginator.paginate.side_effect = [
+            [{'Contents': [
+                {
+                    'Key': 'genome_data/source=ncbi/species=homo_sapiens/chr=22/year=2026/month=05/sequences.parquet',
+                    'LastModified': datetime(2026, 5, 31, 5, 0, 0, tzinfo=timezone.utc),
+                }
+            ]}],
+            [{'Contents': [
+                {
+                    'Key': 'pattern_data/source=ncbi/species=homo_sapiens/chr=22/year=2026/month=04/patterns.parquet',
+                    'LastModified': datetime(2026, 4, 30, 5, 0, 0, tzinfo=timezone.utc),
+                }
+            ]}],
+            [{'Contents': []}],
+        ]
+        self.s3_client.get_paginator.return_value = paginator
+
+        response = lambda_handler(
+            {
+                'requestContext': {'http': {'method': 'POST'}},
+                'rawPath': '/api/chromosomes/22/sync',
+            },
+            None,
+        )
+
+        body = json.loads(response['body'])
+        self.assertEqual(response['statusCode'], 200)
+        self.assertIn('partition_added:2_tables', body['actions'])
+        self.assertEqual(self.athena_client.start_query_execution.call_count, 2)
+        query_strings = [
+            call.kwargs['QueryString']
+            for call in self.athena_client.start_query_execution.call_args_list
+        ]
+        self.assertTrue(any("year='2026', month='05'" in query for query in query_strings))
+        self.assertTrue(any("year='2026', month='04'" in query for query in query_strings))
+        self.assertTrue(any("LOCATION 's3://genome-pipeline-output-443568785165/genome_data/source=ncbi/species=homo_sapiens/chr=22/year=2026/month=05/'" in query for query in query_strings))
+        self.assertTrue(any("LOCATION 's3://genome-pipeline-output-443568785165/pattern_data/source=ncbi/species=homo_sapiens/chr=22/year=2026/month=04/'" in query for query in query_strings))
 
     def test_annotations_route_with_overlap_window(self):
         """Annotation route should return overlapping known genes for a chromosome window."""

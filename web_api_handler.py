@@ -301,6 +301,49 @@ def latest_object_for_dataset(
     return latest
 
 
+def partition_details_for_dataset(
+    bucket: str,
+    dataset_key: str,
+    chromosome: str,
+    source: str = "ncbi",
+    species: str = "homo_sapiens",
+) -> Optional[Dict[str, str]]:
+    latest = latest_object_for_dataset(
+        bucket,
+        dataset_key,
+        chromosome=chromosome,
+        source=source,
+        species=species,
+    )
+    if not latest:
+        return None
+
+    prefix = DATASET_PREFIXES[dataset_key]
+    key = latest["Key"]
+    import re
+
+    match = re.match(
+        rf"^{re.escape(prefix)}/source=([^/]+)/species=([^/]+)/chr=([^/]+)/year=(\d{{4}})/month=(\d{{2}})/[^/]+$",
+        key,
+    )
+    if not match:
+        return None
+
+    item_source, item_species, item_chr, year, month = match.groups()
+    return {
+        "source": item_source,
+        "species": item_species,
+        "chromosome": item_chr.upper() if item_chr.lower() in {"x", "y"} else item_chr,
+        "year": year,
+        "month": month,
+        "location": (
+            f"s3://{bucket}/{prefix}/source={item_source}/species={item_species}/"
+            f"chr={item_chr}/year={year}/month={month}/"
+        ),
+        "key": key,
+    }
+
+
 def format_timestamp(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -528,7 +571,7 @@ def get_chromosome_pattern_rows(chromosome: str, limit: int = 10) -> List[Dict[s
     return run_athena_query(query)
 
 
-def get_chromosome_region_rows(chromosome: str, limit: int = 2000) -> List[Dict[str, Optional[str]]]:
+def get_chromosome_region_rows(chromosome: str, limit: int = 5000) -> List[Dict[str, Optional[str]]]:
     chromosome = safe_chromosome(chromosome)
     query = f"""
     SELECT DISTINCT
@@ -744,10 +787,16 @@ def build_chromosome_summary(chromosome: str) -> Dict[str, Any]:
     patterns = latest_object_for_dataset(bucket, "patterns", chromosome=chromosome)
     regions = latest_object_for_dataset(bucket, "regions", chromosome=chromosome)
     annotations = latest_object_for_dataset(bucket, "annotations", chromosome=chromosome)
-    metrics = get_chromosome_metrics(chromosome)
+    try:
+        metrics = get_chromosome_metrics(chromosome)
+        pattern_rows = get_chromosome_pattern_rows(chromosome, limit=5)
+        region_rows = get_chromosome_region_rows(chromosome, limit=5)
+    except Exception as exc:
+        logger.warning("Athena summary enrichment unavailable for chr%s: %s", chromosome, exc)
+        metrics = {}
+        pattern_rows = []
+        region_rows = []
     sequence_length = resolve_sequence_length(chromosome, metrics.get("sequence_length"))
-    pattern_rows = get_chromosome_pattern_rows(chromosome, limit=5)
-    region_rows = get_chromosome_region_rows(chromosome, limit=5)
     top_pattern = pattern_rows[0] if pattern_rows else None
     support = summarize_full_analysis_support(
         sequence_ready=item["sequence_ready"],
@@ -1095,13 +1144,18 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/regions"):
         chromosome = path.rstrip("/").split("/")[-2]
+        query = event.get("queryStringParameters") or {}
+        limit = query.get("limit")
         ck = f"CHR#{safe_chromosome(chromosome)}#REGIONS"
         cached = cache_get(ck)
         if cached:
             return json_response(200, cached, cache_seconds=3600)
         data = {
             "chromosome": safe_chromosome(chromosome),
-            "items": get_chromosome_region_rows(chromosome),
+            "items": get_chromosome_region_rows(
+                chromosome,
+                limit=int(limit) if limit not in (None, "") else 5000,
+            ),
         }
         cache_put(ck, data, ttl_seconds=3600)
         return json_response(200, data, cache_seconds=3600)
@@ -1161,14 +1215,18 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
         chromosome = path.rstrip("/").split("/")[-2]
         return json_response(200, get_chromosome_batch_status(chromosome))
 
+    if method == "POST" and "/api/chromosomes/" in path and path.endswith("/annotations/sync"):
+        chromosome = path.rstrip("/").split("/")[-3]
+        payload = parse_body(event)
+        species = payload.get("species", "homo_sapiens")
+        return json_response(202, submit_gene_annotation_sync(chromosome, species=species))
+
     if method == "POST" and "/api/chromosomes/" in path and path.endswith("/sync"):
         chromosome = safe_chromosome(path.rstrip("/").split("/")[-2])
         results = {"chromosome": chromosome, "actions": []}
         import time as _t
 
-        # Step 1: Explicitly add the partition for this chromosome using ALTER TABLE.
-        # MSCK REPAIR can miss partitions in race conditions (file just written vs scan timing).
-        # ALTER TABLE ADD PARTITION with a specific path is deterministic and immediate.
+        # Step 1: Explicitly add only the partitions that actually exist in S3.
         try:
             results_bucket = resolve_athena_results_bucket()
             bucket = resolve_output_bucket()
@@ -1179,21 +1237,19 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
             }
             db = resolve_athena_database()
             wg = resolve_athena_workgroup()
-            chr_upper = chromosome.upper() if chromosome.lower() in ("x", "y") else chromosome
-
-            # Detect year/month from the latest S3 object for this chromosome
-            import datetime as _dt
-            now = _dt.datetime.utcnow()
-            year, month = str(now.year), f"{now.month:02d}"
 
             add_ids = []
             for table, prefix in table_dirs.items():
-                location = (f"s3://{bucket}/{prefix}/source=ncbi/species=homo_sapiens"
-                            f"/chr={chromosome}/year={year}/month={month}/")
+                dataset_key = next(
+                    key for key, value in DATASET_PREFIXES.items() if value == prefix
+                )
+                partition = partition_details_for_dataset(bucket, dataset_key, chromosome)
+                if not partition:
+                    continue
                 sql = (f"ALTER TABLE {db}.{table} ADD IF NOT EXISTS "
-                       f"PARTITION (source='ncbi', species='homo_sapiens', "
-                       f"chr='{chromosome}', year='{year}', month='{month}') "
-                       f"LOCATION '{location}'")
+                       f"PARTITION (source='{partition['source']}', species='{partition['species']}', "
+                       f"chr='{partition['chromosome']}', year='{partition['year']}', month='{partition['month']}') "
+                       f"LOCATION '{partition['location']}'")
                 resp = athena_client.start_query_execution(
                     QueryString=sql,
                     WorkGroup=wg,
@@ -1247,12 +1303,6 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
         payload = parse_body(event)
         species = payload.get("species", "homo_sapiens")
         return json_response(202, submit_single_chromosome_analysis(chromosome, species=species))
-
-    if method == "POST" and "/api/chromosomes/" in path and path.endswith("/annotations/sync"):
-        chromosome = path.rstrip("/").split("/")[-3]
-        payload = parse_body(event)
-        species = payload.get("species", "homo_sapiens")
-        return json_response(202, submit_gene_annotation_sync(chromosome, species=species))
 
     if method == "POST" and path.endswith("/api/jobs"):
         payload = parse_body(event)
