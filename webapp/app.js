@@ -761,8 +761,7 @@ function applySummary(summary) {
   const hasRealData = summary.pattern_hit_count && summary.pattern_hit_count !== "0";
   const patternsKnownReady = summary.patterns_ready && summary.regions_ready;
   if (patternsKnownReady && !hasRealData) {
-    // Athena hasn't propagated yet — clear all stale data so nothing from
-    // a previous chromosome leaks into this chromosome's loading state
+    // Athena hasn't propagated yet — clear stale data and auto-trigger /sync
     activePatternItems = [];
     patternRows.length = 0;
 
@@ -775,13 +774,26 @@ function applySummary(summary) {
       orfs: "Loading from Athena…",
     });
     renderSummaryCards();
-    renderPatternTable(); // clears badges immediately
+    renderPatternTable();
     if (!isZoomedIn) {
-      renderSelectedChromosomeVisual(); // re-renders SVG with empty activePatternItems
+      renderSelectedChromosomeVisual();
       if (selectedChromosomeVisualNote) {
         selectedChromosomeVisualNote.textContent =
           "Loading analysis data from Athena — pattern and region windows will appear shortly.";
       }
+    }
+
+    // Auto-trigger /sync so Glue partition + cache are fixed automatically
+    // (handles cases where the batch poll skipped sync because patternsReady=True)
+    const chr = summary.chromosome;
+    if (API_BASE_URL && !window._autoSyncing) {
+      window._autoSyncing = chr;
+      fetch(`${API_BASE_URL}/api/chromosomes/${chr}/sync`, { method: "POST" })
+        .then(() => {
+          window._autoSyncing = null;
+          setTimeout(() => hydrateDashboard(), 5000);
+        })
+        .catch(e => { window._autoSyncing = null; console.warn("auto-sync failed", e); });
     }
     return;
   }
