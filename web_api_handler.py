@@ -8,18 +8,22 @@ for status, chromosome availability, and safe queue submission.
 import json
 import logging
 import os
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import unquote
 
 import boto3
+from operations_store import (
+    build_processing_status,
+    get_current_status,
+    record_submission,
+)
 
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-
-import time as _time
 
 s3_client = boto3.client("s3")
 sqs_client = boto3.client("sqs")
@@ -27,49 +31,6 @@ logs_client = boto3.client("logs")
 sts_client = boto3.client("sts")
 athena_client = boto3.client("athena")
 batch_client = boto3.client("batch")
-ddb_client = boto3.client("dynamodb")
-
-CACHE_TABLE = os.environ.get("CACHE_TABLE", "genome-pipeline-cache")
-
-
-def cache_get(key: str) -> Optional[Dict]:
-    """Read a cached API response from DynamoDB. Returns parsed dict or None."""
-    try:
-        resp = ddb_client.get_item(TableName=CACHE_TABLE, Key={"pk": {"S": key}})
-        item = resp.get("Item")
-        if item and "data" in item:
-            return json.loads(item["data"]["S"])
-    except Exception as exc:
-        logger.debug("DynamoDB cache miss or error for %s: %s", key, exc)
-    return None
-
-
-def cache_put(key: str, data: Dict, ttl_seconds: int = 3600) -> None:
-    """Write an API response to DynamoDB with a TTL. Fire-and-forget.
-    Never caches empty items arrays — empty means 'not ready yet', not 'done'."""
-    items = data.get("items")
-    if isinstance(items, list) and len(items) == 0:
-        return  # Don't cache empty results; let the next request retry Athena
-    try:
-        ddb_client.put_item(
-            TableName=CACHE_TABLE,
-            Item={
-                "pk": {"S": key},
-                "data": {"S": json.dumps(data)},
-                "ttl": {"N": str(int(_time.time()) + ttl_seconds)},
-            },
-        )
-    except Exception as exc:
-        logger.warning("DynamoDB cache write failed for %s: %s", key, exc)
-
-
-def cache_delete(keys: List[str]) -> None:
-    """Delete one or more cache entries (e.g. after new analysis data lands)."""
-    for key in keys:
-        try:
-            ddb_client.delete_item(TableName=CACHE_TABLE, Key={"pk": {"S": key}})
-        except Exception as exc:
-            logger.warning("DynamoDB cache delete failed for %s: %s", key, exc)
 
 
 DATASET_PREFIXES = {
@@ -136,14 +97,18 @@ HUMAN_CHROMOSOME_LENGTHS = {
 ALLOWED_ANALYSIS_MODES = {"full", "sequence_only"}
 ALLOWED_JOB_TYPES = {"sequence_analysis", "gene_annotations"}
 FULL_ANALYSIS_MAX_BASES = int(os.environ.get("FULL_ANALYSIS_MAX_BASES", "60000000"))
+BATCH_ACTIVE_STATUSES = ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING")
+BATCH_RECENT_STATUSES = BATCH_ACTIVE_STATUSES + ("SUCCEEDED", "FAILED")
 
 
-def json_response(status_code: int, body: Dict[str, Any], cache_seconds: int = 0) -> Dict[str, Any]:
-    cache_control = (
-        f"public, max-age={cache_seconds}, stale-while-revalidate=60"
-        if cache_seconds > 0
-        else "no-cache, no-store, must-revalidate"
-    )
+def json_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
+    def _json_default(value: Any) -> Any:
+        if isinstance(value, Decimal):
+            if value % 1 == 0:
+                return int(value)
+            return float(value)
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
     return {
         "statusCode": status_code,
         "headers": {
@@ -151,9 +116,8 @@ def json_response(status_code: int, body: Dict[str, Any], cache_seconds: int = 0
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": "Content-Type",
             "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-            "Cache-Control": cache_control,
         },
-        "body": json.dumps(body),
+        "body": json.dumps(body, default=_json_default),
     }
 
 
@@ -301,49 +265,6 @@ def latest_object_for_dataset(
     return latest
 
 
-def partition_details_for_dataset(
-    bucket: str,
-    dataset_key: str,
-    chromosome: str,
-    source: str = "ncbi",
-    species: str = "homo_sapiens",
-) -> Optional[Dict[str, str]]:
-    latest = latest_object_for_dataset(
-        bucket,
-        dataset_key,
-        chromosome=chromosome,
-        source=source,
-        species=species,
-    )
-    if not latest:
-        return None
-
-    prefix = DATASET_PREFIXES[dataset_key]
-    key = latest["Key"]
-    import re
-
-    match = re.match(
-        rf"^{re.escape(prefix)}/source=([^/]+)/species=([^/]+)/chr=([^/]+)/year=(\d{{4}})/month=(\d{{2}})/[^/]+$",
-        key,
-    )
-    if not match:
-        return None
-
-    item_source, item_species, item_chr, year, month = match.groups()
-    return {
-        "source": item_source,
-        "species": item_species,
-        "chromosome": item_chr.upper() if item_chr.lower() in {"x", "y"} else item_chr,
-        "year": year,
-        "month": month,
-        "location": (
-            f"s3://{bucket}/{prefix}/source={item_source}/species={item_species}/"
-            f"chr={item_chr}/year={year}/month={month}/"
-        ),
-        "key": key,
-    }
-
-
 def format_timestamp(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -479,44 +400,124 @@ def summarize_full_analysis_support(
         return {
             "eligible": False,
             "status": "size_unknown",
-            "reason": "Sequence length is not available yet, so Lambda eligibility cannot be confirmed.",
+            "reason": "Sequence length is not available yet, so full-analysis routing cannot be confirmed.",
             "max_bases": FULL_ANALYSIS_MAX_BASES,
             "backend": "none",
         }
 
-    if length_value > FULL_ANALYSIS_MAX_BASES:
-        if batch_full_analysis_enabled():
-            return {
-                "eligible": True,
-                "status": "batch_required",
-                "reason": (
-                    f"Chromosome is {length_value:,} bp, above the Lambda full-analysis "
-                    f"limit of {FULL_ANALYSIS_MAX_BASES:,} bp. This job will run on AWS Batch on Fargate."
-                ),
-                "max_bases": FULL_ANALYSIS_MAX_BASES,
-                "backend": "batch",
-            }
+    if batch_full_analysis_enabled():
         return {
-            "eligible": False,
-            "status": "too_large",
+            "eligible": True,
+            "status": "batch_required",
             "reason": (
-                f"Chromosome is {length_value:,} bp, above the current Lambda full-analysis "
-                f"limit of {FULL_ANALYSIS_MAX_BASES:,} bp."
+                f"Chromosome is {length_value:,} bp. Full chromosome analysis runs on "
+                "AWS Batch on Fargate for predictable memory and runtime."
             ),
             "max_bases": FULL_ANALYSIS_MAX_BASES,
-            "backend": "none",
+            "backend": "batch",
         }
 
     return {
-        "eligible": True,
-        "status": "eligible",
+        "eligible": False,
+        "status": "batch_unavailable",
         "reason": (
-            f"Chromosome is within the current Lambda full-analysis limit "
-            f"({FULL_ANALYSIS_MAX_BASES:,} bp)."
+            "Full chromosome analysis is configured to run on AWS Batch, but the Batch "
+            "job queue or job definition is not available right now."
         ),
         "max_bases": FULL_ANALYSIS_MAX_BASES,
-        "backend": "lambda",
+        "backend": "none",
     }
+
+
+def batch_job_expected_minutes(chromosome: str) -> Optional[int]:
+    chromosome = safe_chromosome(chromosome)
+    length_value = HUMAN_CHROMOSOME_LENGTHS.get(chromosome)
+    if not length_value:
+        return None
+    return max(6, round(length_value / 4000000))
+
+
+def batch_job_progress(status: str, elapsed_minutes: int, expected_minutes: Optional[int]) -> int:
+    status = (status or "").upper()
+    if status == "SUCCEEDED":
+        return 100
+    if status == "FAILED":
+        return 0
+    if status in {"SUBMITTED", "PENDING"}:
+        return 5
+    if status == "RUNNABLE":
+        return 12
+    if status == "STARTING":
+        return 22
+    if status == "RUNNING":
+        if expected_minutes and expected_minutes > 0:
+            return min(96, max(28, round((elapsed_minutes / expected_minutes) * 100)))
+        return 40
+    return 0
+
+
+def normalize_batch_status(job: Dict[str, Any], chromosome: str) -> Dict[str, Any]:
+    created_at_ms = int(job.get("createdAt") or 0)
+    started_at_ms = int(job.get("startedAt") or 0)
+    stopped_at_ms = int(job.get("stoppedAt") or 0)
+    started_reference_ms = started_at_ms or created_at_ms
+    finished_reference_ms = stopped_at_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
+    elapsed_minutes = 0
+    if started_reference_ms:
+        elapsed_minutes = max(0, round((finished_reference_ms - started_reference_ms) / 60000))
+    expected_minutes = batch_job_expected_minutes(chromosome)
+    status = str(job.get("status") or "UNKNOWN").upper()
+
+    return {
+        "job_id": job.get("jobId"),
+        "job_name": job.get("jobName"),
+        "status": status,
+        "status_reason": job.get("statusReason"),
+        "created_at": format_timestamp(
+            datetime.fromtimestamp(created_at_ms / 1000, tz=timezone.utc) if created_at_ms else None
+        ),
+        "started_at": format_timestamp(
+            datetime.fromtimestamp(started_at_ms / 1000, tz=timezone.utc) if started_at_ms else None
+        ),
+        "stopped_at": format_timestamp(
+            datetime.fromtimestamp(stopped_at_ms / 1000, tz=timezone.utc) if stopped_at_ms else None
+        ),
+        "elapsed_minutes": elapsed_minutes,
+        "expected_minutes": expected_minutes,
+        "progress_pct": batch_job_progress(status, elapsed_minutes, expected_minutes),
+    }
+
+
+def latest_batch_job_for_chromosome(chromosome: str) -> Optional[Dict[str, Any]]:
+    chromosome = safe_chromosome(chromosome)
+    job_queue = resolve_batch_job_queue()
+    if not job_queue:
+        return None
+
+    matching_jobs: List[Dict[str, Any]] = []
+    needle = f"chr{chromosome.lower()}-"
+
+    for status in BATCH_RECENT_STATUSES:
+        try:
+            response = batch_client.list_jobs(
+                jobQueue=job_queue,
+                jobStatus=status,
+                maxResults=100,
+            )
+        except Exception as exc:
+            logger.warning("Unable to list AWS Batch jobs for %s: %s", chromosome, exc)
+            return None
+
+        for job in response.get("jobSummaryList", []):
+            job_name = str(job.get("jobName") or "")
+            if needle in job_name.lower():
+                matching_jobs.append(job)
+
+    if not matching_jobs:
+        return None
+
+    latest = max(matching_jobs, key=lambda item: int(item.get("createdAt") or 0))
+    return normalize_batch_status(latest, chromosome)
 
 
 def get_chromosome_metrics(chromosome: str) -> Dict[str, Optional[str]]:
@@ -571,8 +572,23 @@ def get_chromosome_pattern_rows(chromosome: str, limit: int = 10) -> List[Dict[s
     return run_athena_query(query)
 
 
-def get_chromosome_region_rows(chromosome: str, limit: int = 5000) -> List[Dict[str, Optional[str]]]:
+def get_chromosome_pattern_summary(chromosome: str) -> Dict[str, Optional[str]]:
     chromosome = safe_chromosome(chromosome)
+    query = f"""
+    SELECT
+      CAST(COUNT(*) AS bigint) AS pattern_hit_count
+    FROM sequence_patterns
+    WHERE source = 'ncbi'
+      AND species = 'homo_sapiens'
+      AND chr = '{chromosome}'
+    """
+    rows = run_athena_query(query)
+    return rows[0] if rows else {}
+
+
+def get_chromosome_region_rows(chromosome: str, limit: int = 12) -> List[Dict[str, Optional[str]]]:
+    chromosome = safe_chromosome(chromosome)
+    safe_limit = max(1, min(int(limit), 10000))
     query = f"""
     SELECT DISTINCT
       CAST(window_start AS bigint) AS window_start,
@@ -586,72 +602,23 @@ def get_chromosome_region_rows(chromosome: str, limit: int = 5000) -> List[Dict[
       AND species = 'homo_sapiens'
       AND chr = '{chromosome}'
     ORDER BY window_start ASC
-    LIMIT {int(limit)}
+    LIMIT {safe_limit}
     """
     return run_athena_query(query)
 
 
-def get_chromosome_orf_positions(
-    chromosome: str,
-    region_start: Optional[int] = None,
-    region_end: Optional[int] = None,
-    limit: int = 2000,
-) -> List[Dict[str, Optional[str]]]:
+def get_chromosome_region_summary(chromosome: str) -> Dict[str, Optional[str]]:
     chromosome = safe_chromosome(chromosome)
-    filters = [
-        "source = 'ncbi'",
-        "species = 'homo_sapiens'",
-        f"chr = '{chromosome}'",
-        "pattern_type = 'orf'",
-    ]
-    if region_start is not None:
-        filters.append(f'"end" >= {int(region_start)}')
-    if region_end is not None:
-        filters.append(f'"start" <= {int(region_end)}')
-
     query = f"""
     SELECT
-      "start"  AS pos_start,
-      "end"    AS pos_end,
-      length   AS hit_length,
-      strand,
-      score
-    FROM sequence_patterns
-    WHERE {' AND '.join(filters)}
-    LIMIT {int(limit)}
+      CAST(COALESCE(SUM(orf_count), 0) AS bigint) AS orf_count
+    FROM sequence_regions
+    WHERE source = 'ncbi'
+      AND species = 'homo_sapiens'
+      AND chr = '{chromosome}'
     """
-    return run_athena_query(query, timeout_seconds=55)
-
-
-def get_chromosome_cpg_positions(
-    chromosome: str,
-    region_start: Optional[int] = None,
-    region_end: Optional[int] = None,
-    limit: int = 5000,
-) -> List[Dict[str, Optional[str]]]:
-    chromosome = safe_chromosome(chromosome)
-    filters = [
-        "source = 'ncbi'",
-        "species = 'homo_sapiens'",
-        f"chr = '{chromosome}'",
-        "pattern_type = 'motif'",
-        "LOWER(pattern_name) LIKE '%cpg%'",
-    ]
-    if region_start is not None:
-        filters.append(f'"end" >= {int(region_start)}')
-    if region_end is not None:
-        filters.append(f'"start" <= {int(region_end)}')
-
-    query = f"""
-    SELECT
-      "start" AS pos_start,
-      "end"   AS pos_end,
-      length  AS hit_length
-    FROM sequence_patterns
-    WHERE {' AND '.join(filters)}
-    LIMIT {int(limit)}
-    """
-    return run_athena_query(query, timeout_seconds=55)
+    rows = run_athena_query(query)
+    return rows[0] if rows else {}
 
 
 def get_chromosome_annotation_rows(
@@ -736,11 +703,7 @@ def build_chromosome_inventory() -> List[Dict[str, Any]]:
     pattern_ready = chromosome_set_for_dataset(bucket, "patterns")
     region_ready = chromosome_set_for_dataset(bucket, "regions")
     annotation_ready = chromosome_set_for_dataset(bucket, "annotations")
-    try:
-        metrics_by_chromosome = get_all_chromosome_metrics()
-    except Exception as exc:
-        logger.warning("Athena metrics unavailable, building inventory from S3 only: %s", exc)
-        metrics_by_chromosome = {}
+    metrics_by_chromosome = get_all_chromosome_metrics()
 
     items = []
     for chromosome in HUMAN_CHROMOSOMES:
@@ -787,16 +750,12 @@ def build_chromosome_summary(chromosome: str) -> Dict[str, Any]:
     patterns = latest_object_for_dataset(bucket, "patterns", chromosome=chromosome)
     regions = latest_object_for_dataset(bucket, "regions", chromosome=chromosome)
     annotations = latest_object_for_dataset(bucket, "annotations", chromosome=chromosome)
-    try:
-        metrics = get_chromosome_metrics(chromosome)
-        pattern_rows = get_chromosome_pattern_rows(chromosome, limit=5)
-        region_rows = get_chromosome_region_rows(chromosome, limit=5)
-    except Exception as exc:
-        logger.warning("Athena summary enrichment unavailable for chr%s: %s", chromosome, exc)
-        metrics = {}
-        pattern_rows = []
-        region_rows = []
+    metrics = get_chromosome_metrics(chromosome)
     sequence_length = resolve_sequence_length(chromosome, metrics.get("sequence_length"))
+    pattern_rows = get_chromosome_pattern_rows(chromosome, limit=5)
+    region_rows = get_chromosome_region_rows(chromosome, limit=5)
+    pattern_summary = get_chromosome_pattern_summary(chromosome)
+    region_summary = get_chromosome_region_summary(chromosome)
     top_pattern = pattern_rows[0] if pattern_rows else None
     support = summarize_full_analysis_support(
         sequence_ready=item["sequence_ready"],
@@ -804,6 +763,9 @@ def build_chromosome_summary(chromosome: str) -> Dict[str, Any]:
         regions_ready=item["regions_ready"],
         sequence_length=sequence_length,
     )
+    batch_status = latest_batch_job_for_chromosome(chromosome)
+    current_status = get_current_status(chromosome)
+    processing_status = build_processing_status(current_status, fallback_chromosome=chromosome)
 
     return {
         "chromosome": chromosome,
@@ -823,9 +785,11 @@ def build_chromosome_summary(chromosome: str) -> Dict[str, Any]:
         "full_analysis_reason": support["reason"],
         "full_analysis_max_bases": support["max_bases"],
         "full_analysis_backend": support["backend"],
-        "pattern_hit_count": str(sum(int(row.get("hit_count") or "0") for row in pattern_rows)),
+        "batch_status": batch_status,
+        "processing_status": processing_status,
+        "pattern_hit_count": str(int(pattern_summary.get("pattern_hit_count") or "0")),
         "top_pattern": top_pattern,
-        "orf_count": str(sum(int(row.get("orf_count") or "0") for row in region_rows)),
+        "orf_count": str(int(region_summary.get("orf_count") or "0")),
     }
 
 
@@ -876,76 +840,15 @@ def enqueue_job(payload: Dict[str, Any]) -> Dict[str, Any]:
         QueueUrl=resolve_queue_url(),
         MessageBody=json.dumps(normalized),
     )
+    record_submission(
+        normalized,
+        backend="lambda",
+        message_id=response.get("MessageId"),
+    )
 
     return {
         "message_id": response.get("MessageId"),
         "job": normalized,
-    }
-
-
-CHROMOSOME_EXPECTED_MINUTES: Dict[str, int] = {
-    "1": 55, "2": 53, "3": 44, "4": 42, "5": 40, "6": 38,
-    "7": 35, "8": 32, "9": 30, "10": 29, "11": 30, "12": 29,
-    "13": 25, "14": 23, "15": 22, "16": 20, "17": 18, "18": 18,
-    "19": 13, "20": 14, "21": 10, "22": 11, "X": 34, "Y": 13,
-}
-
-
-def get_chromosome_batch_status(chromosome: str) -> Dict[str, Any]:
-    chromosome = safe_chromosome(chromosome)
-    job_queue = resolve_batch_job_queue()
-    if not job_queue:
-        return {"status": "not_configured"}
-
-    prefix = f"{resolve_project_name()}-chr{chromosome.lower()}-"
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-    # Search active states first, then recently finished
-    search_order = ["RUNNING", "STARTING", "RUNNABLE", "PENDING", "SUBMITTED", "SUCCEEDED", "FAILED"]
-    latest: Optional[Dict] = None
-
-    for state in search_order:
-        try:
-            resp = batch_client.list_jobs(jobQueue=job_queue, jobStatus=state)
-        except Exception:
-            continue
-        for job in resp.get("jobSummaryList", []):
-            if not job.get("jobName", "").startswith(prefix):
-                continue
-            if latest is None or job.get("createdAt", 0) > latest.get("createdAt", 0):
-                latest = job
-        if latest and latest.get("status") in ("RUNNING", "STARTING", "RUNNABLE", "PENDING", "SUBMITTED"):
-            break
-
-    if not latest:
-        return {"status": "no_job"}
-
-    status = latest.get("status", "UNKNOWN")
-    started_at = latest.get("startedAt")
-    elapsed_minutes: Optional[float] = None
-    if started_at:
-        elapsed_minutes = round((now_ms - started_at) / 60000, 1)
-
-    expected = CHROMOSOME_EXPECTED_MINUTES.get(chromosome, 35)
-    progress_pct: Optional[int] = None
-    if status == "SUCCEEDED":
-        progress_pct = 100
-    elif status in ("SUBMITTED", "PENDING", "RUNNABLE"):
-        progress_pct = 0
-    elif status == "STARTING":
-        progress_pct = 2
-    elif status == "RUNNING" and elapsed_minutes is not None:
-        progress_pct = min(95, round((elapsed_minutes / expected) * 100))
-    elif status == "FAILED":
-        progress_pct = None
-
-    return {
-        "status": status,
-        "job_id": latest.get("jobId"),
-        "job_name": latest.get("jobName"),
-        "elapsed_minutes": elapsed_minutes,
-        "progress_pct": progress_pct,
-        "expected_minutes": expected,
     }
 
 
@@ -968,25 +871,21 @@ def submit_batch_job(payload: Dict[str, Any]) -> Dict[str, Any]:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     job_name = f"{resolve_project_name()}-chr{chromosome.lower()}-{timestamp}"
 
-    patch_bucket = resolve_output_bucket()
-    patch_key = "batch-patches/lambda_handler.py"
-    patch_cmd = (
-        f"python -c \""
-        f"import boto3; boto3.client('s3').download_file('{patch_bucket}','{patch_key}','/app/lambda_handler.py'); "
-        f"print('patch applied')"
-        f"\" && python /app/batch_entrypoint.py"
-    )
-
     response = batch_client.submit_job(
         jobName=job_name,
         jobQueue=job_queue,
         jobDefinition=job_definition,
         containerOverrides={
-            "command": ["bash", "-c", patch_cmd],
             "environment": [
                 {"name": "JOB_PAYLOAD", "value": json.dumps(normalized)},
-            ],
+            ]
         },
+    )
+    record_submission(
+        normalized,
+        backend="batch",
+        batch_job_id=response.get("jobId"),
+        batch_job_name=response.get("jobName"),
     )
 
     return {
@@ -1039,24 +938,6 @@ def submit_single_chromosome_analysis(chromosome: str, species: str = "homo_sapi
         "output_prefix": f"human_genome/chr{chromosome}",
         "analysis_mode": "full",
     }
-
-    # Reuse existing raw FASTA from S3 if available — avoids re-downloading from NCBI
-    bucket = resolve_output_bucket()
-    raw_prefix = f"raw_data/source=ncbi/species={species}/chr={chromosome}/"
-    try:
-        paginator = s3_client.get_paginator("list_objects_v2")
-        latest_raw = None
-        for page in paginator.paginate(Bucket=bucket, Prefix=raw_prefix):
-            for obj in page.get("Contents", []):
-                if obj["Key"].endswith(".fasta") or obj["Key"].endswith(".fa"):
-                    if latest_raw is None or obj["LastModified"] > latest_raw["LastModified"]:
-                        latest_raw = obj
-        if latest_raw:
-            payload["s3_raw_key"] = latest_raw["Key"]
-            logger.info(f"Reusing raw file for chr{chromosome}: {latest_raw['Key']}")
-    except Exception as exc:
-        logger.warning("Could not look up existing raw file: %s", exc)
-
     backend = item.get("full_analysis_backend") or "lambda"
     if backend == "batch":
         submission = submit_batch_job(payload)
@@ -1100,96 +981,36 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
         return json_response(200, {"ok": True})
 
     if method == "GET" and path.endswith("/api/status/overview"):
-        cached = cache_get("OVERVIEW")
-        if cached:
-            return json_response(200, cached, cache_seconds=30)
-        data = build_overview()
-        cache_put("OVERVIEW", data, ttl_seconds=30)
-        return json_response(200, data, cache_seconds=30)
+        return json_response(200, build_overview())
 
     if method == "GET" and path.endswith("/api/chromosomes"):
-        cached = cache_get("CHROMOSOMES")
-        if cached:
-            return json_response(200, cached, cache_seconds=120)
-        data = {"items": build_chromosome_inventory()}
-        cache_put("CHROMOSOMES", data, ttl_seconds=120)
-        return json_response(200, data, cache_seconds=120)
+        return json_response(200, {"items": build_chromosome_inventory()})
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/summary"):
         chromosome = path.rstrip("/").split("/")[-2]
-        ck = f"CHR#{safe_chromosome(chromosome)}#SUMMARY"
-        cached = cache_get(ck)
-        if cached:
-            return json_response(200, cached, cache_seconds=300)
-        data = build_chromosome_summary(chromosome)
-        # Only cache when Athena has real pattern data — never cache 0-hit summaries
-        # (a zero hit count means MSCK REPAIR hasn't propagated yet)
-        if (data.get("patterns_ready") and data.get("regions_ready")
-                and data.get("pattern_hit_count") not in (None, "", "0")):
-            cache_put(ck, data, ttl_seconds=300)
-        return json_response(200, data, cache_seconds=300)
+        return json_response(200, build_chromosome_summary(chromosome))
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/patterns"):
         chromosome = path.rstrip("/").split("/")[-2]
-        ck = f"CHR#{safe_chromosome(chromosome)}#PATTERNS"
-        cached = cache_get(ck)
-        if cached:
-            return json_response(200, cached, cache_seconds=3600)
-        data = {
-            "chromosome": safe_chromosome(chromosome),
-            "items": get_chromosome_pattern_rows(chromosome),
-        }
-        cache_put(ck, data, ttl_seconds=3600)
-        return json_response(200, data, cache_seconds=3600)
+        return json_response(
+            200,
+            {
+                "chromosome": safe_chromosome(chromosome),
+                "items": get_chromosome_pattern_rows(chromosome),
+            },
+        )
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/regions"):
         chromosome = path.rstrip("/").split("/")[-2]
         query = event.get("queryStringParameters") or {}
         limit = query.get("limit")
-        ck = f"CHR#{safe_chromosome(chromosome)}#REGIONS"
-        cached = cache_get(ck)
-        if cached:
-            return json_response(200, cached, cache_seconds=3600)
-        data = {
-            "chromosome": safe_chromosome(chromosome),
-            "items": get_chromosome_region_rows(
-                chromosome,
-                limit=int(limit) if limit not in (None, "") else 5000,
-            ),
-        }
-        cache_put(ck, data, ttl_seconds=3600)
-        return json_response(200, data, cache_seconds=3600)
-
-    if method == "GET" and "/api/chromosomes/" in path and path.endswith("/orfs"):
-        chromosome = path.rstrip("/").split("/")[-2]
-        query = event.get("queryStringParameters") or {}
-        region_start = query.get("start")
-        region_end = query.get("end")
         return json_response(
             200,
             {
                 "chromosome": safe_chromosome(chromosome),
-                "items": get_chromosome_orf_positions(
+                "items": get_chromosome_region_rows(
                     chromosome,
-                    region_start=int(region_start) if region_start not in (None, "") else None,
-                    region_end=int(region_end) if region_end not in (None, "") else None,
-                ),
-            },
-        )
-
-    if method == "GET" and "/api/chromosomes/" in path and path.endswith("/cpg"):
-        chromosome = path.rstrip("/").split("/")[-2]
-        query = event.get("queryStringParameters") or {}
-        region_start = query.get("start")
-        region_end = query.get("end")
-        return json_response(
-            200,
-            {
-                "chromosome": safe_chromosome(chromosome),
-                "items": get_chromosome_cpg_positions(
-                    chromosome,
-                    region_start=int(region_start) if region_start not in (None, "") else None,
-                    region_end=int(region_end) if region_end not in (None, "") else None,
+                    limit=int(limit) if limit not in (None, "") else 12,
                 ),
             },
         )
@@ -1213,96 +1034,34 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
 
     if method == "GET" and "/api/chromosomes/" in path and path.endswith("/batch-status"):
         chromosome = path.rstrip("/").split("/")[-2]
-        return json_response(200, get_chromosome_batch_status(chromosome))
+        return json_response(
+            200,
+            latest_batch_job_for_chromosome(chromosome) or {},
+        )
 
-    if method == "POST" and "/api/chromosomes/" in path and path.endswith("/annotations/sync"):
-        chromosome = path.rstrip("/").split("/")[-3]
-        payload = parse_body(event)
-        species = payload.get("species", "homo_sapiens")
-        return json_response(202, submit_gene_annotation_sync(chromosome, species=species))
-
-    if method == "POST" and "/api/chromosomes/" in path and path.endswith("/sync"):
-        chromosome = safe_chromosome(path.rstrip("/").split("/")[-2])
-        results = {"chromosome": chromosome, "actions": []}
-        import time as _t
-
-        # Step 1: Explicitly add only the partitions that actually exist in S3.
-        try:
-            results_bucket = resolve_athena_results_bucket()
-            bucket = resolve_output_bucket()
-            table_dirs = {
-                "genome_sequences": "genome_data",
-                "sequence_patterns": "pattern_data",
-                "sequence_regions": "region_data",
-            }
-            db = resolve_athena_database()
-            wg = resolve_athena_workgroup()
-
-            add_ids = []
-            for table, prefix in table_dirs.items():
-                dataset_key = next(
-                    key for key, value in DATASET_PREFIXES.items() if value == prefix
-                )
-                partition = partition_details_for_dataset(bucket, dataset_key, chromosome)
-                if not partition:
-                    continue
-                sql = (f"ALTER TABLE {db}.{table} ADD IF NOT EXISTS "
-                       f"PARTITION (source='{partition['source']}', species='{partition['species']}', "
-                       f"chr='{partition['chromosome']}', year='{partition['year']}', month='{partition['month']}') "
-                       f"LOCATION '{partition['location']}'")
-                resp = athena_client.start_query_execution(
-                    QueryString=sql,
-                    WorkGroup=wg,
-                    ResultConfiguration={"OutputLocation": f"s3://{results_bucket}/partition-repair/"},
-                )
-                add_ids.append(resp["QueryExecutionId"])
-
-            # Wait for ALTER TABLE queries (fast, usually <5s)
-            deadline = _t.time() + 30
-            pending = set(add_ids)
-            while pending and _t.time() < deadline:
-                _t.sleep(2)
-                for qid in list(pending):
-                    state = athena_client.get_query_execution(
-                        QueryExecutionId=qid
-                    )["QueryExecution"]["Status"]["State"]
-                    if state in ("SUCCEEDED", "FAILED", "CANCELLED"):
-                        pending.discard(qid)
-            results["actions"].append(f"partition_added:{len(add_ids)}_tables")
-        except Exception as e:
-            results["partition_error"] = str(e)
-
-        # Step 2: Clear DynamoDB cache
-        try:
-            chr_upper = chromosome.upper() if chromosome.lower() in ("x", "y") else chromosome
-            cache_delete([f"CHR#{chr_upper}#SUMMARY", f"CHR#{chr_upper}#PATTERNS",
-                          f"CHR#{chr_upper}#REGIONS", "CHROMOSOMES", "OVERVIEW"])
-            results["actions"].append("ddb_cleared")
-        except Exception as e:
-            results["ddb_error"] = str(e)
-
-        # Step 3: Invalidate CloudFront so no stale empty responses are served
-        try:
-            cf_id = os.environ.get("API_CF_DISTRIBUTION_ID")
-            if cf_id:
-                cf_client = boto3.client("cloudfront")
-                cf_client.create_invalidation(
-                    DistributionId=cf_id,
-                    InvalidationBatch={
-                        "Paths": {"Quantity": 2, "Items": ["/api/chromosomes", f"/api/chromosomes/{chromosome}/*"]},
-                        "CallerReference": f"sync-{chromosome}-{int(_t.time())}",
-                    },
-                )
-                results["actions"].append("cf_invalidated")
-        except Exception as e:
-            results["cf_error"] = str(e)
-        return json_response(200, results)
+    if method == "GET" and "/api/chromosomes/" in path and path.endswith("/operations"):
+        chromosome = path.rstrip("/").split("/")[-2]
+        current_status = get_current_status(chromosome)
+        return json_response(
+            200,
+            {
+                "chromosome": safe_chromosome(chromosome),
+                "item": current_status,
+                "processing_status": build_processing_status(current_status, fallback_chromosome=chromosome),
+            },
+        )
 
     if method == "POST" and "/api/chromosomes/" in path and path.endswith("/analyze"):
         chromosome = path.rstrip("/").split("/")[-2]
         payload = parse_body(event)
         species = payload.get("species", "homo_sapiens")
         return json_response(202, submit_single_chromosome_analysis(chromosome, species=species))
+
+    if method == "POST" and "/api/chromosomes/" in path and path.endswith("/annotations/sync"):
+        chromosome = path.rstrip("/").split("/")[-3]
+        payload = parse_body(event)
+        species = payload.get("species", "homo_sapiens")
+        return json_response(202, submit_gene_annotation_sync(chromosome, species=species))
 
     if method == "POST" and path.endswith("/api/jobs"):
         payload = parse_body(event)
@@ -1328,10 +1087,6 @@ def route(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    # EventBridge keep-warm ping — return immediately without touching Athena
-    if event.get("source") == "warmup":
-        logger.info("Keep-warm ping received")
-        return {"statusCode": 200, "body": "warm"}
     try:
         return route(event)
     except ValueError as exc:

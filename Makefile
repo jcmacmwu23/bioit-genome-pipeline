@@ -119,6 +119,7 @@ build-function: ## Build Lambda function package
 	@echo "$(YELLOW)Building Lambda function...$(NC)"
 	mkdir -p $(BUILD_DIR)/function
 	cp lambda_handler.py $(BUILD_DIR)/function/
+	cp operations_store.py $(BUILD_DIR)/function/
 	mkdir -p $(DIST_DIR)
 	cd $(BUILD_DIR)/function && zip -r ../../$(DIST_DIR)/lambda_function.zip . -q
 	@echo "$(GREEN)Lambda function built: $(DIST_DIR)/lambda_function.zip ($$(du -h $(DIST_DIR)/lambda_function.zip | cut -f1))$(NC)"
@@ -128,6 +129,7 @@ build-web-api: ## Build dashboard API Lambda package
 	rm -rf $(BUILD_DIR)/web_api
 	mkdir -p $(BUILD_DIR)/web_api
 	cp web_api_handler.py $(BUILD_DIR)/web_api/
+	cp operations_store.py $(BUILD_DIR)/web_api/
 	mkdir -p $(DIST_DIR)
 	cd $(BUILD_DIR)/web_api && zip -r ../../$(DIST_DIR)/web_api_function.zip . -q
 	@echo "$(GREEN)Web API function built: $(DIST_DIR)/web_api_function.zip ($$(du -h $(DIST_DIR)/web_api_function.zip | cut -f1))$(NC)"

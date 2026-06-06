@@ -24,7 +24,7 @@ The key design goal is reuse: Batch is not a separate analytics pipeline. It is 
 
 ## Routing Rule
 
-The API decides the backend in [web_api_handler.py](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/web_api_handler.py).
+The API decides the backend in [web_api_handler.py](web_api_handler.py).
 
 - If `patterns_ready` and `regions_ready` already exist, full analysis is treated as complete.
 - If `sequence_ready` is false, full analysis is blocked.
@@ -43,7 +43,7 @@ The important defaults currently in Terraform are:
 - Batch max vCPUs in compute environment: `256`
 - Batch image tag: `latest`
 
-These values live in [main.tf](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/main.tf).
+These values live in [main.tf](main.tf).
 
 ## AWS Resources Involved
 
@@ -59,11 +59,11 @@ The Batch-on-Fargate path uses these resources:
 - CloudWatch log group for Batch jobs
 - Existing S3 temp and output buckets
 
-The Terraform resources are defined in [main.tf](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/main.tf).
+The Terraform resources are defined in [main.tf](main.tf).
 
 ## Container Build
 
-The Batch container is defined in [Dockerfile.batch](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/Dockerfile.batch).
+The Batch container is defined in [Dockerfile.batch](Dockerfile.batch).
 
 It currently does the following:
 
@@ -85,7 +85,7 @@ python /app/batch_entrypoint.py
 
 ## Batch Entrypoint Contract
 
-The Batch job entrypoint is [batch_entrypoint.py](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/batch_entrypoint.py).
+The Batch job entrypoint is [batch_entrypoint.py](batch_entrypoint.py).
 
 Important behavior:
 
@@ -117,11 +117,11 @@ The payload is injected into the Batch task as:
 JOB_PAYLOAD=<json>
 ```
 
-The Batch submission logic lives in [web_api_handler.py](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/web_api_handler.py).
+The Batch submission logic lives in [web_api_handler.py](web_api_handler.py).
 
 ## Dashboard Behavior
 
-The dashboard behavior for large chromosomes is implemented in [webapp/app.js](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/webapp/app.js).
+The dashboard behavior for large chromosomes is implemented in [webapp/app.js](webapp/app.js).
 
 Current UX:
 
@@ -256,6 +256,44 @@ Full analysis should be promoted intentionally:
 
 In normal operation, a chromosome should only need heavy full analysis once per code version / reference version / parameter set. After that, the stored S3 Parquet outputs become the source for Athena queries and dashboard reads.
 
+### 5. S3 success does not guarantee Athena visibility
+
+One real failure mode during chr14 troubleshooting was:
+
+- Batch job `SUCCEEDED`
+- pattern and region Parquet files existed in S3
+- dashboard still showed `Loading from Athena`
+- Athena returned `0` rows for the chromosome
+
+Root cause:
+
+- the relevant `sequence_patterns` and `sequence_regions` partitions were missing from Athena even though the files were present in S3
+
+Operational takeaway:
+
+When a finished chromosome still looks stuck, verify all three layers separately:
+
+1. Batch status
+2. S3 objects
+3. Athena partitions and Athena row counts
+
+If S3 is healthy but Athena is empty, repair or add the missing partitions before rerunning compute.
+
+### 6. Early chromosome windows may be biologically empty
+
+Another real dashboard gotcha showed up on chr13 and chr14:
+
+- the first windows in `sequence_regions` were all zero
+- the summary was correct
+- the lens looked blank because it only displayed the earliest windows
+
+This was not a failed analysis. Those chromosomes began with long low-signal / `N`-rich stretches, and the first informative window appeared much later in the chromosome.
+
+Operational takeaway:
+
+- treat an all-zero leading slice as a visualization clue, not automatic evidence of pipeline failure
+- prefer dashboard sampling that can surface informative windows from across the chromosome
+
 ## Recommended Workflow Going Forward
 
 1. Use `sequence_only` to land all chromosomes.
@@ -266,10 +304,10 @@ In normal operation, a chromosome should only need heavy full analysis once per 
 
 ## Relevant Files
 
-- [main.tf](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/main.tf)
-- [Dockerfile.batch](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/Dockerfile.batch)
-- [batch_entrypoint.py](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/batch_entrypoint.py)
-- [web_api_handler.py](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/web_api_handler.py)
-- [webapp/app.js](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/webapp/app.js)
-- [DASHBOARD_BUILD_STEPS.md](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/DASHBOARD_BUILD_STEPS.md)
-- [FULLSTACK_BLUEPRINT.md](/Users/turtlemasterflex/Documents/Misc/ Job Search/ BioIT Project/BioAPI pipeline/bioproject files/FULLSTACK_BLUEPRINT.md)
+- [main.tf](main.tf)
+- [Dockerfile.batch](Dockerfile.batch)
+- [batch_entrypoint.py](batch_entrypoint.py)
+- [web_api_handler.py](web_api_handler.py)
+- [webapp/app.js](webapp/app.js)
+- [DASHBOARD_BUILD_STEPS.md](DASHBOARD_BUILD_STEPS.md)
+- [FULLSTACK_BLUEPRINT.md](FULLSTACK_BLUEPRINT.md)

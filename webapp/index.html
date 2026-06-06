@@ -20,9 +20,9 @@
           <h1>AWS data lake pipeline for human genome analysis.</h1>
           <p class="hero-text">
             An end-to-end data pipeline that pulls chromosome sequences from the NCBI API,
-            processes them through a high-performance C++ FASTA parser running on Lambda and
-            AWS Batch, and lands Parquet datasets in an S3 data lake — queryable via Athena
-            and visualized here.
+            processes them through a high-performance C++ FASTA parser running on Lambda
+            and AWS Batch, and lands Parquet datasets in an S3 data lake, queryable via
+            Athena and visualized here.
           </p>
           <div class="hero-actions">
             <a class="button button-primary" href="#overview">Open Overview</a>
@@ -156,34 +156,32 @@
               <div id="chromosomeGrid" class="chromosome-grid"></div>
             </article>
 
-            <article class="card">
-              <h3>Example summary cards</h3>
-              <div id="summaryCards" class="summary-cards"></div>
+            <article class="card summary-atlas-card">
+              <div class="summary-atlas-layout">
+                <div class="summary-block">
+                  <h3>Example summary cards</h3>
+                  <div id="summaryCards" class="summary-cards"></div>
+                </div>
+                <div class="atlas-inline">
+                  <h3>Chromosome atlas</h3>
+                  <div id="chromosomeAtlas" class="visual-stage visual-stage-atlas"></div>
+                </div>
+              </div>
             </article>
           </div>
 
-          <div class="visual-layout">
-            <article class="card visual-card">
-              <h3>Chromosome atlas</h3>
-              <p class="card-caption">
-                Ideogram-style atlas scaled by chromosome length, with the selected chromosome
-                highlighted and completed outputs marked as ready.
-              </p>
-              <div id="chromosomeAtlas" class="visual-stage"></div>
-            </article>
-
-            <article class="card visual-card">
-              <h3>Selected chromosome lens</h3>
-              <p class="card-caption">
-                A focused ideogram plus an analysis window track built from the current
-                region-level outputs for the selected chromosome.
-              </p>
-              <div id="selectedChromosomeVisual" class="visual-stage visual-stage-focus"></div>
-              <p id="selectedChromosomeVisualNote" class="chart-note">
-                Load a chromosome to inspect its ideogram and region-level analysis windows.
-              </p>
-            </article>
-          </div>
+          <article class="card visual-card lens-card">
+            <h3>Selected chromosome lens</h3>
+            <p class="card-caption">
+              A focused ideogram plus an analysis window track built from the current
+              region-level outputs for the selected chromosome, with both broad scroll view
+              and a deeper zoomed detail mode.
+            </p>
+            <div id="selectedChromosomeVisual" class="visual-stage visual-stage-focus"></div>
+            <p id="selectedChromosomeVisualNote" class="chart-note">
+              Load a chromosome to inspect its ideogram and region-level analysis windows.
+            </p>
+          </article>
         </section>
 
         <section class="panel" id="analysis">
@@ -197,45 +195,49 @@
             </p>
           </div>
 
-          <div class="analysis-grid">
+          <div class="analysis-grid analysis-grid-tables">
             <article class="card">
               <h3>Pattern leaderboard</h3>
-              <table class="data-table">
-                <thead>
-                  <tr>
-                    <th>Pattern</th>
-                    <th>Type</th>
-                    <th>Hits</th>
-                  </tr>
-                </thead>
-                <tbody id="patternTable"></tbody>
-              </table>
+              <div class="table-scroll-frame">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Pattern</th>
+                      <th>Type</th>
+                      <th>Hits</th>
+                    </tr>
+                  </thead>
+                  <tbody id="patternTable"></tbody>
+                </table>
+              </div>
             </article>
 
             <article class="card">
               <h3>Candidate coding regions</h3>
-              <table class="data-table">
-                <thead>
-                  <tr>
-                    <th>Window</th>
-                    <th>GC %</th>
-                    <th>ORFs</th>
-                  </tr>
-                </thead>
-                <tbody id="orfTable"></tbody>
-              </table>
-            </article>
-
-            <article class="card">
-              <h3>Region chart preview</h3>
-              <div class="chart-card">
-                <div id="gcBars" class="bar-chart"></div>
-                <p class="chart-note">
-                  GC-content windows for the selected chromosome.
-                </p>
+              <div class="table-scroll-frame">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Window</th>
+                      <th>GC %</th>
+                      <th>ORFs</th>
+                    </tr>
+                  </thead>
+                  <tbody id="orfTable"></tbody>
+                </table>
               </div>
             </article>
           </div>
+
+          <article class="card analysis-chart-card">
+            <h3>Region chart preview</h3>
+            <div class="chart-card">
+              <div id="gcBars" class="bar-chart"></div>
+              <p id="regionChartNote" class="chart-note">
+                GC-content windows for the selected chromosome.
+              </p>
+            </div>
+          </article>
         </section>
 
         <section class="panel" id="controls">

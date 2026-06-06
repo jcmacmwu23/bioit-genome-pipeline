@@ -9,6 +9,7 @@ import tempfile
 import subprocess
 import sys
 import types
+from decimal import Decimal
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch, MagicMock
 
@@ -197,6 +198,56 @@ class TestLambdaHandler(unittest.TestCase):
         raw_key = build_raw_output_key(event, 'ncbi')
         self.assertIn('raw_data/source=ncbi/species=homo_sapiens/chr=22/', raw_key)
         self.assertTrue(raw_key.endswith('.fasta'))
+
+    def test_register_glue_partition_uses_dataset_table_and_partition_path(self):
+        """Uploaded parquet outputs should register their Glue partition immediately."""
+        import lambda_handler
+        from lambda_handler import register_glue_partition, glue_client, athena_client
+
+        glue_client.get_table.return_value = {
+            'Table': {
+                'StorageDescriptor': {
+                    'Columns': [{'Name': 'pattern_name', 'Type': 'string'}],
+                    'InputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat',
+                    'OutputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat',
+                    'Compressed': False,
+                    'SerdeInfo': {
+                        'SerializationLibrary': 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
+                    },
+                    'StoredAsSubDirectories': False,
+                }
+            }
+        }
+        athena_client.start_query_execution.return_value = {'QueryExecutionId': 'qa-1'}
+        athena_client.get_query_execution.return_value = {
+            'QueryExecution': {'Status': {'State': 'SUCCEEDED'}}
+        }
+
+        with patch.object(lambda_handler, 'ATHENA_WORKGROUP', 'genome-pipeline-workgroup'), \
+             patch.object(lambda_handler, 'ATHENA_RESULTS_BUCKET', 'genome-pipeline-athena-results-443568785165'):
+            register_glue_partition(
+                'patterns',
+                'genome-pipeline-output-443568785165',
+                'pattern_data/source=ncbi/species=homo_sapiens/chr=16/year=2026/month=06/chr16_patterns_20260605_175805.parquet',
+            )
+
+        glue_client.create_partition.assert_called_once()
+        kwargs = glue_client.create_partition.call_args.kwargs
+        self.assertEqual(kwargs['DatabaseName'], 'genome_pipeline_db')
+        self.assertEqual(kwargs['TableName'], 'sequence_patterns')
+        self.assertEqual(
+            kwargs['PartitionInput']['Values'],
+            ['ncbi', 'homo_sapiens', '16', '2026', '06'],
+        )
+        self.assertEqual(
+            kwargs['PartitionInput']['StorageDescriptor']['Location'],
+            's3://genome-pipeline-output-443568785165/pattern_data/source=ncbi/species=homo_sapiens/chr=16/year=2026/month=06/',
+        )
+        athena_client.start_query_execution.assert_called_once()
+        athena_query = athena_client.start_query_execution.call_args.kwargs['QueryString']
+        self.assertIn("ALTER TABLE sequence_patterns", athena_query)
+        self.assertIn("ADD IF NOT EXISTS PARTITION", athena_query)
+        self.assertIn("chr='16'", athena_query)
     
     def test_event_validation(self):
         """Test event schema validation"""
@@ -424,9 +475,10 @@ class TestWebAPIHandler(unittest.TestCase):
         self.sts_client = MagicMock()
         self.athena_client = MagicMock()
         self.batch_client = MagicMock()
-        self.ddb_client = MagicMock()
+        self.dynamodb_table = MagicMock()
+        self.dynamodb_resource = MagicMock()
+        self.dynamodb_resource.Table.return_value = self.dynamodb_table
         self.sts_client.get_caller_identity.return_value = {'Account': '443568785165'}
-        self.ddb_client.get_item.return_value = {}
 
         client_map = {
             's3': self.s3_client,
@@ -435,10 +487,10 @@ class TestWebAPIHandler(unittest.TestCase):
             'sts': self.sts_client,
             'athena': self.athena_client,
             'batch': self.batch_client,
-            'dynamodb': self.ddb_client,
         }
         self.boto3_module = types.SimpleNamespace(
-            client=MagicMock(side_effect=lambda service, **kwargs: client_map[service])
+            client=MagicMock(side_effect=lambda service, **kwargs: client_map[service]),
+            resource=MagicMock(return_value=self.dynamodb_resource),
         )
 
         self.module_patcher = patch.dict(sys.modules, {'boto3': self.boto3_module})
@@ -543,6 +595,9 @@ class TestWebAPIHandler(unittest.TestCase):
 
         body = json.loads(response['body'])
         self.assertEqual(response['statusCode'], 200)
+        self.assertEqual(body['chromosome'], '22')
+        self.assertEqual(len(body['items']), 2)
+        self.assertEqual(body['items'][0]['pattern_name'], 'CpG-like motif')
         self.assertEqual(body['queue']['depth'], 22)
         self.assertEqual(body['queue']['dlq_depth'], 0)
         self.assertEqual(body['datasets']['sequence_ready_count'], 2)
@@ -602,6 +657,8 @@ class TestWebAPIHandler(unittest.TestCase):
             {'QueryExecutionId': 'q1'},
             {'QueryExecutionId': 'q2'},
             {'QueryExecutionId': 'q3'},
+            {'QueryExecutionId': 'q4'},
+            {'QueryExecutionId': 'q5'},
         ]
         self.athena_client.get_query_execution.return_value = {
             'QueryExecution': {'Status': {'State': 'SUCCEEDED'}}
@@ -611,10 +668,14 @@ class TestWebAPIHandler(unittest.TestCase):
             [self._athena_rows_page(['sequence_length', 'avg_gc_content'], [[50818468, 36.22]])],
             [self._athena_rows_page(['pattern_name', 'pattern_type', 'hit_count'], [['CpG-like motif', 'motif', 1482], ['candidate ORF', 'orf', 221]])],
             [self._athena_rows_page(['window_start', 'window_end', 'gc_content', 'orf_count', 'motif_hits', 'repeat_bases'], [[0, 100000, 35.8, 4, 12, 700], [100000, 200000, 37.3, 7, 16, 820]])],
+            [self._athena_rows_page(['pattern_hit_count'], [[1703]])],
+            [self._athena_rows_page(['orf_count'], [[11]])],
         ]
         self.athena_client.get_paginator.return_value = athena_paginator
 
-        with patch('web_api_handler.build_chromosome_inventory') as mock_inventory, patch('web_api_handler.latest_object_for_dataset') as mock_latest:
+        with patch('web_api_handler.build_chromosome_inventory') as mock_inventory, \
+             patch('web_api_handler.latest_object_for_dataset') as mock_latest, \
+             patch('web_api_handler.latest_batch_job_for_chromosome') as mock_batch_status:
             mock_inventory.return_value = [
                 {
                     'chromosome': '22',
@@ -626,6 +687,14 @@ class TestWebAPIHandler(unittest.TestCase):
                     'latest_key': 'genome_data/source=ncbi/species=homo_sapiens/chr=22/year=2026/month=05/file.parquet',
                 }
             ]
+            mock_batch_status.return_value = {
+                'job_id': 'batch-22',
+                'job_name': 'genome-pipeline-chr22-20260605000000',
+                'status': 'RUNNING',
+                'elapsed_minutes': 8,
+                'expected_minutes': 14,
+                'progress_pct': 57,
+            }
             mock_latest.side_effect = [
                 {'Key': 'pattern_data/source=ncbi/species=homo_sapiens/chr=22/year=2026/month=05/patterns.parquet'},
                 {'Key': 'region_data/source=ncbi/species=homo_sapiens/chr=22/year=2026/month=05/regions.parquet'},
@@ -650,49 +719,64 @@ class TestWebAPIHandler(unittest.TestCase):
         self.assertEqual(body['pattern_hit_count'], '1703')
         self.assertEqual(body['orf_count'], '11')
         self.assertTrue(body['annotations_ready'])
+        self.assertEqual(body['batch_status']['status'], 'RUNNING')
 
-    def test_chromosome_summary_route_falls_back_when_athena_fails(self):
-        """Summary route should still render inventory-backed status if Athena is unavailable."""
+    def test_chromosome_summary_uses_aggregate_orf_count_not_preview_rows(self):
+        """Summary ORF count should come from the full chromosome aggregate, not the first preview windows."""
         from web_api_handler import lambda_handler
 
-        self.athena_client.start_query_execution.side_effect = RuntimeError('athena unavailable')
+        self.athena_client.start_query_execution.side_effect = [
+            {'QueryExecutionId': 'q1'},
+            {'QueryExecutionId': 'q2'},
+            {'QueryExecutionId': 'q3'},
+            {'QueryExecutionId': 'q4'},
+            {'QueryExecutionId': 'q5'},
+        ]
+        self.athena_client.get_query_execution.return_value = {
+            'QueryExecution': {'Status': {'State': 'SUCCEEDED'}}
+        }
+        athena_paginator = MagicMock()
+        athena_paginator.paginate.side_effect = [
+            [self._athena_rows_page(['sequence_length', 'avg_gc_content'], [[46709983, 35.14]])],
+            [self._athena_rows_page(['pattern_name', 'pattern_type', 'hit_count'], [['CpG-like motif', 'motif', 500000], ['candidate ORF', 'orf', 497034]])],
+            [self._athena_rows_page(['window_start', 'window_end', 'gc_content', 'orf_count', 'motif_hits', 'repeat_bases'], [[0, 100000, 12.1, 0, 0, 5000], [100000, 200000, 14.5, 0, 0, 6000], [200000, 300000, 18.0, 0, 0, 7000]])],
+            [self._athena_rows_page(['pattern_hit_count'], [[997034]])],
+            [self._athena_rows_page(['orf_count'], [[1191]])],
+        ]
+        self.athena_client.get_paginator.return_value = athena_paginator
 
-        with patch('web_api_handler.build_chromosome_inventory') as mock_inventory, patch('web_api_handler.latest_object_for_dataset') as mock_latest:
+        with patch('web_api_handler.build_chromosome_inventory') as mock_inventory, \
+             patch('web_api_handler.latest_object_for_dataset') as mock_latest, \
+             patch('web_api_handler.latest_batch_job_for_chromosome', return_value=None):
             mock_inventory.return_value = [
                 {
-                    'chromosome': '22',
+                    'chromosome': '21',
                     'sequence_ready': True,
-                    'patterns_ready': False,
-                    'regions_ready': False,
+                    'patterns_ready': True,
+                    'regions_ready': True,
                     'annotations_ready': False,
-                    'latest_output_at': '2026-05-28T03:28:12Z',
-                    'latest_key': 'genome_data/source=ncbi/species=homo_sapiens/chr=22/year=2026/month=05/file.parquet',
-                    'sequence_length': '50818468',
-                    'avg_gc_content': None,
-                    'full_analysis_eligible': True,
-                    'full_analysis_status': 'eligible',
-                    'full_analysis_reason': 'ready',
-                    'full_analysis_max_bases': 60000000,
-                    'full_analysis_backend': 'lambda',
+                    'latest_output_at': '2026-06-06T03:59:39Z',
+                    'latest_key': 'genome_data/source=ncbi/species=homo_sapiens/chr=21/year=2026/month=06/file.parquet',
                 }
             ]
-            mock_latest.side_effect = [None, None, None]
+            mock_latest.side_effect = [
+                {'Key': 'pattern_data/source=ncbi/species=homo_sapiens/chr=21/year=2026/month=06/patterns.parquet'},
+                {'Key': 'region_data/source=ncbi/species=homo_sapiens/chr=21/year=2026/month=06/regions.parquet'},
+                None,
+            ]
 
             response = lambda_handler(
                 {
                     'requestContext': {'http': {'method': 'GET'}},
-                    'rawPath': '/api/chromosomes/22/summary',
+                    'rawPath': '/api/chromosomes/21/summary',
                 },
                 None,
             )
 
         body = json.loads(response['body'])
         self.assertEqual(response['statusCode'], 200)
-        self.assertEqual(body['chromosome'], '22')
-        self.assertEqual(body['sequence_length'], '50818468')
-        self.assertEqual(body['pattern_hit_count'], '0')
-        self.assertEqual(body['orf_count'], '0')
-        self.assertIsNone(body['avg_gc_content'])
+        self.assertEqual(body['pattern_hit_count'], '997034')
+        self.assertEqual(body['orf_count'], '1191')
 
     def test_human_reference_route_defaults_to_sequence_only(self):
         """Human reference route should favor lightweight bulk ingestion."""
@@ -716,10 +800,13 @@ class TestWebAPIHandler(unittest.TestCase):
         self.assertEqual(sent_payload['analysis_mode'], 'sequence_only')
 
     def test_single_chromosome_analysis_route_submits_full_mode(self):
-        """Per-chromosome analysis route should submit a full-analysis job."""
+        """Per-chromosome analysis route should submit a full-analysis Batch job."""
         from web_api_handler import lambda_handler
 
-        self.sqs_client.send_message.return_value = {'MessageId': 'msg-999'}
+        self.batch_client.submit_job.return_value = {
+            'jobId': 'batch-999',
+            'jobName': 'genome-pipeline-chr1-20260603070000',
+        }
 
         with patch('web_api_handler.build_chromosome_inventory') as mock_inventory:
             mock_inventory.return_value = [
@@ -729,8 +816,9 @@ class TestWebAPIHandler(unittest.TestCase):
                     'patterns_ready': False,
                     'regions_ready': False,
                     'full_analysis_eligible': True,
-                    'full_analysis_status': 'eligible',
-                    'full_analysis_reason': 'Chromosome is within the current Lambda full-analysis limit (60,000,000 bp).',
+                    'full_analysis_status': 'batch_required',
+                    'full_analysis_backend': 'batch',
+                    'full_analysis_reason': 'Chromosome is 248,956,422 bp. Full chromosome analysis runs on AWS Batch on Fargate for predictable memory and runtime.',
                     'latest_output_at': '2026-06-03T05:36:58Z',
                     'latest_key': 'genome_data/source=ncbi/species=homo_sapiens/chr=1/year=2026/month=06/file.parquet',
                 }
@@ -749,12 +837,12 @@ class TestWebAPIHandler(unittest.TestCase):
         self.assertEqual(response['statusCode'], 202)
         self.assertEqual(body['chromosome'], '1')
         self.assertEqual(body['analysis_mode'], 'full')
-        sent_payload = json.loads(self.sqs_client.send_message.call_args[1]['MessageBody'])
-        self.assertEqual(sent_payload['analysis_mode'], 'full')
-        self.assertEqual(sent_payload['chromosome'], '1')
+        self.assertEqual(body['analysis_backend'], 'batch')
+        self.batch_client.submit_job.assert_called_once()
+        self.sqs_client.send_message.assert_not_called()
 
-    def test_single_chromosome_analysis_route_rejects_large_chromosome(self):
-        """Per-chromosome analysis route should reject oversized Lambda jobs."""
+    def test_single_chromosome_analysis_route_rejects_when_batch_unavailable(self):
+        """Per-chromosome analysis route should reject when Batch is unavailable."""
         from web_api_handler import lambda_handler
 
         with patch('web_api_handler.build_chromosome_inventory') as mock_inventory:
@@ -765,8 +853,8 @@ class TestWebAPIHandler(unittest.TestCase):
                     'patterns_ready': False,
                     'regions_ready': False,
                     'full_analysis_eligible': False,
-                    'full_analysis_status': 'too_large',
-                    'full_analysis_reason': 'Chromosome is 248,956,422 bp, above the current Lambda full-analysis limit of 60,000,000 bp.',
+                    'full_analysis_status': 'batch_unavailable',
+                    'full_analysis_reason': 'Full chromosome analysis is configured to run on AWS Batch, but the Batch job queue or job definition is not available right now.',
                     'latest_output_at': '2026-06-03T05:36:58Z',
                     'latest_key': 'genome_data/source=ncbi/species=homo_sapiens/chr=1/year=2026/month=06/file.parquet',
                 }
@@ -784,11 +872,11 @@ class TestWebAPIHandler(unittest.TestCase):
         body = json.loads(response['body'])
         self.assertEqual(response['statusCode'], 400)
         self.assertEqual(body['error'], 'bad_request')
-        self.assertIn('above the current Lambda full-analysis limit', body['message'])
+        self.assertIn('AWS Batch', body['message'])
         self.sqs_client.send_message.assert_not_called()
 
-    def test_single_chromosome_analysis_route_submits_batch_for_large_chromosome(self):
-        """Oversized chromosomes should use AWS Batch on Fargate when configured."""
+    def test_single_chromosome_analysis_route_submits_batch_for_full_analysis(self):
+        """Full-analysis chromosomes should use AWS Batch on Fargate when configured."""
         from web_api_handler import lambda_handler
 
         self.batch_client.submit_job.return_value = {
@@ -806,7 +894,7 @@ class TestWebAPIHandler(unittest.TestCase):
                     'full_analysis_eligible': True,
                     'full_analysis_status': 'batch_required',
                     'full_analysis_backend': 'batch',
-                    'full_analysis_reason': 'Chromosome is 248,956,422 bp, above the Lambda full-analysis limit of 60,000,000 bp. This job will run on AWS Batch on Fargate.',
+                    'full_analysis_reason': 'Chromosome is 248,956,422 bp. Full chromosome analysis runs on AWS Batch on Fargate for predictable memory and runtime.',
                     'latest_output_at': '2026-06-03T05:36:58Z',
                     'latest_key': 'genome_data/source=ncbi/species=homo_sapiens/chr=1/year=2026/month=06/file.parquet',
                 }
@@ -854,60 +942,108 @@ class TestWebAPIHandler(unittest.TestCase):
 
         body = json.loads(response['body'])
         self.assertEqual(response['statusCode'], 200)
-        self.assertEqual(body['chromosome'], '22')
-        self.assertEqual(len(body['items']), 2)
-        self.assertEqual(body['items'][0]['pattern_name'], 'CpG-like motif')
 
-    def test_sync_route_uses_actual_latest_partition_paths(self):
-        """Manual sync should register the partition that really exists in S3."""
+    def test_batch_status_route_returns_recent_job(self):
+        """Batch status route exposes the newest matching job for a chromosome."""
         from web_api_handler import lambda_handler
 
-        self.athena_client.start_query_execution.side_effect = [
-            {'QueryExecutionId': 'sync-1'},
-            {'QueryExecutionId': 'sync-2'},
-        ]
-        self.athena_client.get_query_execution.return_value = {
-            'QueryExecution': {'Status': {'State': 'SUCCEEDED'}}
+        current_time_ms = int(datetime(2026, 6, 5, 22, 50, tzinfo=timezone.utc).timestamp() * 1000)
+        running_job = {
+            'jobId': 'batch-18',
+            'jobName': 'genome-pipeline-chr18-20260605224428',
+            'status': 'RUNNING',
+            'createdAt': current_time_ms - (18 * 60 * 1000),
+            'startedAt': current_time_ms - (12 * 60 * 1000),
+            'statusReason': 'Container running',
         }
-
-        paginator = MagicMock()
-        paginator.paginate.side_effect = [
-            [{'Contents': [
-                {
-                    'Key': 'genome_data/source=ncbi/species=homo_sapiens/chr=22/year=2026/month=05/sequences.parquet',
-                    'LastModified': datetime(2026, 5, 31, 5, 0, 0, tzinfo=timezone.utc),
-                }
-            ]}],
-            [{'Contents': [
-                {
-                    'Key': 'pattern_data/source=ncbi/species=homo_sapiens/chr=22/year=2026/month=04/patterns.parquet',
-                    'LastModified': datetime(2026, 4, 30, 5, 0, 0, tzinfo=timezone.utc),
-                }
-            ]}],
-            [{'Contents': []}],
+        self.batch_client.list_jobs.side_effect = [
+            {'jobSummaryList': []},
+            {'jobSummaryList': []},
+            {'jobSummaryList': []},
+            {'jobSummaryList': []},
+            {'jobSummaryList': [running_job]},
+            {'jobSummaryList': []},
+            {'jobSummaryList': []},
         ]
-        self.s3_client.get_paginator.return_value = paginator
 
-        response = lambda_handler(
-            {
-                'requestContext': {'http': {'method': 'POST'}},
-                'rawPath': '/api/chromosomes/22/sync',
-            },
-            None,
-        )
+        with patch('web_api_handler.datetime') as mock_datetime:
+            real_datetime = datetime
+            mock_datetime.now.return_value = datetime(2026, 6, 5, 22, 50, tzinfo=timezone.utc)
+            mock_datetime.fromtimestamp.side_effect = lambda *args, **kwargs: real_datetime.fromtimestamp(*args, **kwargs)
+
+            response = lambda_handler(
+                {
+                    'requestContext': {'http': {'method': 'GET'}},
+                    'rawPath': '/api/chromosomes/18/batch-status',
+                },
+                None,
+            )
 
         body = json.loads(response['body'])
         self.assertEqual(response['statusCode'], 200)
-        self.assertIn('partition_added:2_tables', body['actions'])
-        self.assertEqual(self.athena_client.start_query_execution.call_count, 2)
-        query_strings = [
-            call.kwargs['QueryString']
-            for call in self.athena_client.start_query_execution.call_args_list
-        ]
-        self.assertTrue(any("year='2026', month='05'" in query for query in query_strings))
-        self.assertTrue(any("year='2026', month='04'" in query for query in query_strings))
-        self.assertTrue(any("LOCATION 's3://genome-pipeline-output-443568785165/genome_data/source=ncbi/species=homo_sapiens/chr=22/year=2026/month=05/'" in query for query in query_strings))
-        self.assertTrue(any("LOCATION 's3://genome-pipeline-output-443568785165/pattern_data/source=ncbi/species=homo_sapiens/chr=22/year=2026/month=04/'" in query for query in query_strings))
+        self.assertEqual(body['job_id'], 'batch-18')
+        self.assertEqual(body['status'], 'RUNNING')
+        self.assertGreaterEqual(body['progress_pct'], 28)
+        self.assertEqual(body['elapsed_minutes'], 12)
+
+    def test_operations_route_serializes_dynamodb_decimals(self):
+        """Operations route should JSON-encode DynamoDB Decimal fields cleanly."""
+        from web_api_handler import lambda_handler
+
+        with patch('web_api_handler.get_current_status') as mock_current_status, \
+             patch('web_api_handler.build_processing_status') as mock_processing_status:
+            mock_current_status.return_value = {
+                'pk': 'CHR#20',
+                'sk': 'STATUS#sequence_analysis#full',
+                'attempt_count': Decimal('1'),
+                'estimated_duration_minutes': Decimal('16'),
+                'status': 'running',
+            }
+            mock_processing_status.return_value = {
+                'chromosome': '20',
+                'status': 'running',
+                'attempt_count': 1,
+                'expected_minutes': 16,
+                'progress_pct': 12,
+            }
+
+            response = lambda_handler(
+                {
+                    'requestContext': {'http': {'method': 'GET'}},
+                    'rawPath': '/api/chromosomes/20/operations',
+                },
+                None,
+            )
+
+        body = json.loads(response['body'])
+        self.assertEqual(response['statusCode'], 200)
+        self.assertEqual(body['item']['attempt_count'], 1)
+        self.assertEqual(body['item']['estimated_duration_minutes'], 16)
+        self.assertEqual(body['processing_status']['progress_pct'], 12)
+
+    def test_regions_route_honors_limit_query_param(self):
+        """Region route should pass through an explicit limit so the lens can request deeper slices."""
+        from web_api_handler import lambda_handler
+
+        with patch('web_api_handler.get_chromosome_region_rows') as mock_region_rows:
+            mock_region_rows.return_value = [
+                {'window_start': '0', 'window_end': '100000', 'gc_content': '41.2', 'orf_count': '12', 'motif_hits': '44', 'repeat_bases': '1000'}
+            ]
+
+            response = lambda_handler(
+                {
+                    'requestContext': {'http': {'method': 'GET'}},
+                    'rawPath': '/api/chromosomes/18/regions',
+                    'queryStringParameters': {'limit': '5000'},
+                },
+                None,
+            )
+
+        body = json.loads(response['body'])
+        self.assertEqual(response['statusCode'], 200)
+        mock_region_rows.assert_called_once_with('18', limit=5000)
+        self.assertEqual(body['chromosome'], '18')
+        self.assertEqual(len(body['items']), 1)
 
     def test_annotations_route_with_overlap_window(self):
         """Annotation route should return overlapping known genes for a chromosome window."""

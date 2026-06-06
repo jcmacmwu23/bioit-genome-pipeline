@@ -9,7 +9,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY requirements.txt lambda_handler.py batch_entrypoint.py fasta_parser.cpp /app/
+COPY requirements.txt lambda_handler.py operations_store.py batch_entrypoint.py fasta_parser.cpp /app/
 
 RUN mkdir -p /tmp/json/nlohmann /opt/bin \
     && curl -fsSL https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp \

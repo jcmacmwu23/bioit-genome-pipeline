@@ -11,6 +11,7 @@ import tempfile
 import logging
 import re
 from datetime import datetime
+from operations_store import record_failure, record_start, record_success
 
 # Configure logging
 logger = logging.getLogger()
@@ -19,16 +20,11 @@ logger.setLevel(logging.INFO)
 # AWS clients
 s3_client = boto3.client('s3')
 sqs_client = boto3.client('sqs')
+glue_client = boto3.client('glue')
 athena_client = boto3.client('athena')
-sts_client = boto3.client('sts')
-ddb_client = boto3.client('dynamodb')
 
 # Environment variables
 OUTPUT_BUCKET = os.environ.get('OUTPUT_BUCKET')
-ATHENA_DATABASE = os.environ.get('ATHENA_DATABASE', 'genome_pipeline_db')
-ATHENA_WORKGROUP = os.environ.get('ATHENA_WORKGROUP', 'genome-pipeline-workgroup')
-ATHENA_RESULTS_BUCKET = os.environ.get('ATHENA_RESULTS_BUCKET')
-CACHE_TABLE = os.environ.get('CACHE_TABLE')
 CPP_PARSER_PATH = '/opt/bin/fasta_parser'  # C++ binary in Lambda layer
 DATASET_PREFIXES = {
     'sequences': 'genome_data',
@@ -39,125 +35,6 @@ DATASET_PREFIXES = {
 }
 ALLOWED_ANALYSIS_MODES = {'full', 'sequence_only'}
 ALLOWED_JOB_TYPES = {'sequence_analysis', 'gene_annotations'}
-
-DATASET_TABLE_MAP = {
-    'sequences': 'genome_sequences',
-    'patterns': 'sequence_patterns',
-    'regions': 'sequence_regions',
-    'annotations': 'gene_annotations',
-}
-
-
-def parse_partition_details(dataset_key: str, s3_uri: str) -> Optional[Dict[str, str]]:
-    """
-    Extract Hive-style partition values and location from an uploaded dataset URI.
-    """
-    dataset_prefix = DATASET_PREFIXES.get(dataset_key)
-    if not dataset_prefix or not s3_uri.startswith('s3://'):
-        return None
-
-    match = re.match(
-        rf"^s3://([^/]+)/({re.escape(dataset_prefix)}/source=([^/]+)/species=([^/]+)/chr=([^/]+)/year=(\d{{4}})/month=(\d{{2}})/)[^/]+$",
-        s3_uri,
-    )
-    if not match:
-        return None
-
-    bucket, location_key, source, species, chromosome, year, month = match.groups()
-    return {
-        'bucket': bucket,
-        'source': source,
-        'species': species,
-        'chromosome': chromosome.upper() if chromosome.lower() in {'x', 'y'} else chromosome,
-        'year': year,
-        'month': month,
-        'location': f"s3://{bucket}/{location_key}",
-    }
-
-
-def trigger_partition_repair(uploaded_outputs: Dict[str, str], chromosome: Optional[str] = None) -> None:
-    """
-    1. Fire-and-forget targeted ALTER TABLE ADD PARTITION statements.
-    2. Invalidate CloudFront API cache for the chromosome so stale
-       'pending' responses are not served after analysis completes.
-    """
-    partition_jobs = []
-    for dataset_key, s3_uri in uploaded_outputs.items():
-        table = DATASET_TABLE_MAP.get(dataset_key)
-        partition = parse_partition_details(dataset_key, s3_uri)
-        if not table or not partition:
-            continue
-        partition_jobs.append((table, partition))
-
-    if not partition_jobs:
-        return
-    try:
-        account_id = sts_client.get_caller_identity()['Account']
-        results_bucket = ATHENA_RESULTS_BUCKET or f"genome-pipeline-athena-results-{account_id}"
-
-        # 1. Targeted partition add (async, no wait)
-        for table, partition in partition_jobs:
-            try:
-                sql = (
-                    f"ALTER TABLE {ATHENA_DATABASE}.{table} "
-                    f"ADD IF NOT EXISTS PARTITION "
-                    f"(source='{partition['source']}', species='{partition['species']}', "
-                    f"chr='{partition['chromosome']}', year='{partition['year']}', month='{partition['month']}') "
-                    f"LOCATION '{partition['location']}'"
-                )
-                resp = athena_client.start_query_execution(
-                    QueryString=sql,
-                    WorkGroup=ATHENA_WORKGROUP,
-                    ResultConfiguration={
-                        'OutputLocation': f"s3://{results_bucket}/partition-repair/"
-                    },
-                )
-                logger.info(f"Partition add started for {table}: {resp['QueryExecutionId']}")
-            except Exception as exc:
-                logger.warning(f"Partition add could not start for {table}: {exc}")
-
-        # 2. DynamoDB cache invalidation — delete stale entries for this chromosome
-        if CACHE_TABLE and chromosome:
-            chr_upper = chromosome.upper() if chromosome.lower() in ('x', 'y') else chromosome
-            keys_to_delete = [
-                f"CHR#{chr_upper}#SUMMARY",
-                f"CHR#{chr_upper}#PATTERNS",
-                f"CHR#{chr_upper}#REGIONS",
-                "CHROMOSOMES",
-                "OVERVIEW",
-            ]
-            for key in keys_to_delete:
-                try:
-                    ddb_client.delete_item(
-                        TableName=CACHE_TABLE,
-                        Key={"pk": {"S": key}},
-                    )
-                except Exception as exc:
-                    logger.warning(f"DynamoDB cache delete failed for {key}: {exc}")
-            logger.info(f"DynamoDB cache cleared for chr{chromosome}")
-
-        # 3. CloudFront cache invalidation so the dashboard sees fresh data immediately
-        cf_distribution_id = os.environ.get('API_CF_DISTRIBUTION_ID')
-        if cf_distribution_id and chromosome:
-            try:
-                import time
-                cf_client = boto3.client('cloudfront')
-                paths = [
-                    '/api/chromosomes',
-                    f'/api/chromosomes/{chromosome}/*',
-                ]
-                cf_client.create_invalidation(
-                    DistributionId=cf_distribution_id,
-                    InvalidationBatch={
-                        'Paths': {'Quantity': len(paths), 'Items': paths},
-                        'CallerReference': f"post-analysis-{chromosome}-{int(time.time())}",
-                    },
-                )
-                logger.info(f"CloudFront cache invalidated for chr{chromosome}")
-            except Exception as exc:
-                logger.warning(f"CloudFront invalidation failed: {exc}")
-    except Exception as exc:
-        logger.warning(f"trigger_partition_repair failed: {exc}")
 HUMAN_CHROMOSOME_LENGTHS = {
     '1': 248956422,
     '2': 242193529,
@@ -185,6 +62,17 @@ HUMAN_CHROMOSOME_LENGTHS = {
     'Y': 57227415,
 }
 ENSEMBL_GENE_CHUNK_SIZE = 5_000_000
+GLUE_DATABASE = os.environ.get('GLUE_DATABASE', 'genome_pipeline_db')
+ATHENA_DATABASE = os.environ.get('ATHENA_DATABASE', GLUE_DATABASE)
+ATHENA_WORKGROUP = os.environ.get('ATHENA_WORKGROUP')
+ATHENA_RESULTS_BUCKET = os.environ.get('ATHENA_RESULTS_BUCKET')
+GLUE_TABLES = {
+    'sequences': 'genome_sequences',
+    'patterns': 'sequence_patterns',
+    'regions': 'sequence_regions',
+    'annotations': 'gene_annotations',
+}
+_GLUE_TABLE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def extract_job_events(event: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -291,6 +179,145 @@ def normalize_job_type(value: Any) -> str:
 def chromosome_length(chromosome: str) -> Optional[int]:
     normalized = str(chromosome).upper() if str(chromosome).lower() in {'x', 'y'} else str(chromosome)
     return HUMAN_CHROMOSOME_LENGTHS.get(normalized)
+
+
+def partition_values_from_key(key: str) -> Optional[Dict[str, str]]:
+    match = re.search(
+        r"source=([^/]+)/species=([^/]+)/chr=([^/]+)/year=([^/]+)/month=([^/]+)/",
+        key,
+    )
+    if not match:
+        return None
+    return {
+        'source': match.group(1),
+        'species': match.group(2),
+        'chr': match.group(3),
+        'year': match.group(4),
+        'month': match.group(5),
+    }
+
+
+def glue_table_descriptor(table_name: str) -> Dict[str, Any]:
+    cached = _GLUE_TABLE_CACHE.get(table_name)
+    if cached:
+        return cached
+
+    response = glue_client.get_table(DatabaseName=GLUE_DATABASE, Name=table_name)
+    descriptor = response['Table']['StorageDescriptor']
+    _GLUE_TABLE_CACHE[table_name] = descriptor
+    return descriptor
+
+
+def register_glue_partition(dataset_key: str, bucket: str, key: str) -> None:
+    table_name = GLUE_TABLES.get(dataset_key)
+    partition_values = partition_values_from_key(key)
+    if not table_name or not partition_values:
+        logger.info("Skipping Glue registration for dataset=%s key=%s", dataset_key, key)
+        return
+
+    base_descriptor = glue_table_descriptor(table_name)
+    storage_descriptor = {
+        'Columns': base_descriptor.get('Columns', []),
+        'Location': f"s3://{bucket}/{key.rsplit('/', 1)[0]}/",
+        'InputFormat': base_descriptor.get('InputFormat'),
+        'OutputFormat': base_descriptor.get('OutputFormat'),
+        'Compressed': base_descriptor.get('Compressed', False),
+        'SerdeInfo': base_descriptor.get('SerdeInfo', {}),
+        'StoredAsSubDirectories': base_descriptor.get('StoredAsSubDirectories', False),
+    }
+    if 'Parameters' in base_descriptor:
+        storage_descriptor['Parameters'] = base_descriptor['Parameters']
+
+    try:
+        glue_client.create_partition(
+            DatabaseName=GLUE_DATABASE,
+            TableName=table_name,
+            PartitionInput={
+                'Values': [
+                    partition_values['source'],
+                    partition_values['species'],
+                    partition_values['chr'],
+                    partition_values['year'],
+                    partition_values['month'],
+                ],
+                'StorageDescriptor': storage_descriptor,
+            },
+        )
+        logger.info(
+            "Registered Glue partition for %s: chr=%s year=%s month=%s",
+            table_name,
+            partition_values['chr'],
+            partition_values['year'],
+            partition_values['month'],
+        )
+    except Exception as exc:
+        if 'AlreadyExistsException' in str(exc):
+            logger.info("Glue partition already exists for %s key=%s", table_name, key)
+        else:
+            raise
+
+    register_athena_partition(dataset_key, bucket, key)
+
+
+def run_athena_ddl(query: str, timeout_seconds: int = 30) -> None:
+    if not ATHENA_WORKGROUP or not ATHENA_RESULTS_BUCKET:
+        logger.info("Skipping Athena DDL because ATHENA_WORKGROUP or ATHENA_RESULTS_BUCKET is not configured")
+        return
+
+    response = athena_client.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={"Database": ATHENA_DATABASE},
+        WorkGroup=ATHENA_WORKGROUP,
+        ResultConfiguration={
+            "OutputLocation": f"s3://{ATHENA_RESULTS_BUCKET}/query-results/"
+        },
+    )
+    execution_id = response["QueryExecutionId"]
+    deadline = datetime.utcnow().timestamp() + timeout_seconds
+
+    while datetime.utcnow().timestamp() < deadline:
+        execution = athena_client.get_query_execution(QueryExecutionId=execution_id)
+        state = execution["QueryExecution"]["Status"]["State"]
+        if state == "SUCCEEDED":
+            logger.info("Athena DDL succeeded for QueryExecutionId=%s", execution_id)
+            return
+        if state in {"FAILED", "CANCELLED"}:
+            reason = execution["QueryExecution"]["Status"].get("StateChangeReason", state)
+            raise RuntimeError(f"Athena DDL failed: {reason}")
+
+    raise TimeoutError("Athena DDL timed out")
+
+
+def register_athena_partition(dataset_key: str, bucket: str, key: str) -> None:
+    table_name = GLUE_TABLES.get(dataset_key)
+    partition_values = partition_values_from_key(key)
+    if not table_name or not partition_values:
+        logger.info("Skipping Athena registration for dataset=%s key=%s", dataset_key, key)
+        return
+
+    location = f"s3://{bucket}/{key.rsplit('/', 1)[0]}/"
+    query = f"""
+    ALTER TABLE {table_name}
+    ADD IF NOT EXISTS PARTITION (
+      source='{partition_values['source']}',
+      species='{partition_values['species']}',
+      chr='{partition_values['chr']}',
+      year='{partition_values['year']}',
+      month='{partition_values['month']}'
+    )
+    LOCATION '{location}'
+    """
+    try:
+        run_athena_ddl(query)
+        logger.info(
+            "Registered Athena partition for %s: chr=%s year=%s month=%s",
+            table_name,
+            partition_values['chr'],
+            partition_values['year'],
+            partition_values['month'],
+        )
+    except Exception as exc:
+        logger.warning("Athena partition registration failed for %s key=%s: %s", table_name, key, exc)
 
 
 def clean_annotation_description(value: Optional[str]) -> Optional[str]:
@@ -483,7 +510,7 @@ def parse_with_cpp(input_path: str, output_json_path: str, analysis_mode: str = 
             [CPP_PARSER_PATH, input_path, output_json_path, analysis_mode],
             capture_output=True,
             text=True,
-            timeout=None if os.environ.get('AWS_BATCH_JOB_ID') else 840,
+            timeout=300  # 5 minute timeout
         )
         
         if result.returncode != 0:
@@ -723,6 +750,7 @@ def process_gene_annotation_job(job_event: Dict[str, Any]) -> Dict[str, Any]:
         output_key = build_output_key(job_event, source, dataset_key='annotations')
         if not upload_to_s3(parquet_path, OUTPUT_BUCKET, output_key):
             raise Exception("Failed to upload gene annotations to S3")
+        register_glue_partition('annotations', OUTPUT_BUCKET, output_key)
 
     return {
         'job_type': 'gene_annotations',
@@ -778,38 +806,46 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         results = []
 
         for job_event in job_events:
-            job_type = normalize_job_type(job_event.get('job_type', 'sequence_analysis'))
+            backend = 'batch' if os.environ.get('AWS_BATCH_JOB_ID') else 'lambda'
+            record_start(
+                job_event,
+                backend,
+                message_id=job_event.get('message_id'),
+                batch_job_id=os.environ.get('AWS_BATCH_JOB_ID'),
+                batch_job_name=os.environ.get('AWS_BATCH_JOB_NAME'),
+            )
 
-            if job_type == 'gene_annotations':
-                annotation_result = process_gene_annotation_job(job_event)
-                results.append(annotation_result)
-                continue
+            try:
+                job_type = normalize_job_type(job_event.get('job_type', 'sequence_analysis'))
 
-            with tempfile.TemporaryDirectory() as temp_dir:
-                input_file = os.path.join(temp_dir, "input.fasta")
-                json_file = os.path.join(temp_dir, "parsed.json")
-                parquet_files = {
-                    'sequences': os.path.join(temp_dir, "sequences.parquet"),
-                    'patterns': os.path.join(temp_dir, "patterns.parquet"),
-                    'regions': os.path.join(temp_dir, "regions.parquet"),
-                }
+                if job_type == 'gene_annotations':
+                    annotation_result = process_gene_annotation_job(job_event)
+                    annotation_outputs = {
+                        'annotations': f"s3://{OUTPUT_BUCKET}/{annotation_result['annotation_key']}",
+                    }
+                    record_success(
+                        job_event,
+                        backend,
+                        outputs=annotation_outputs,
+                        extra_fields={
+                            'record_count': annotation_result.get('record_count'),
+                        },
+                    )
+                    results.append(annotation_result)
+                    continue
 
-                source = job_event.get('source', 'ncbi')
-                analysis_mode = normalize_analysis_mode(job_event.get('analysis_mode', 'full'))
-                s3_raw_key = job_event.get('s3_raw_key')
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    input_file = os.path.join(temp_dir, "input.fasta")
+                    json_file = os.path.join(temp_dir, "parsed.json")
+                    parquet_files = {
+                        'sequences': os.path.join(temp_dir, "sequences.parquet"),
+                        'patterns': os.path.join(temp_dir, "patterns.parquet"),
+                        'regions': os.path.join(temp_dir, "regions.parquet"),
+                    }
 
-                if s3_raw_key:
-                    # Reuse existing raw file from S3 — skip download entirely
-                    logger.info(f"Reusing existing raw file from s3://{OUTPUT_BUCKET}/{s3_raw_key}")
-                    try:
-                        s3_client.download_file(OUTPUT_BUCKET, s3_raw_key, input_file)
-                        logger.info(f"Downloaded raw file to {input_file}")
-                        success = True
-                    except Exception as exc:
-                        logger.error(f"Failed to download raw file from S3: {exc}")
-                        success = False
-                    raw_key = s3_raw_key
-                else:
+                    source = job_event.get('source', 'ncbi')
+                    analysis_mode = normalize_analysis_mode(job_event.get('analysis_mode', 'full'))
+
                     if source == 'ncbi':
                         accession_id = job_event['accession_id']
                         success = download_from_ncbi(accession_id, input_file)
@@ -830,44 +866,48 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     if not upload_to_s3(input_file, OUTPUT_BUCKET, raw_key):
                         raise Exception("Failed to upload raw genome data to S3")
 
-                if analysis_mode == 'sequence_only':
-                    if not build_sequence_metadata_json(input_file, json_file):
-                        raise Exception("Failed to build sequence metadata")
-                elif not parse_with_cpp(input_file, json_file, analysis_mode=analysis_mode):
-                    raise Exception("Failed to parse genome data")
+                    if analysis_mode == 'sequence_only':
+                        if not build_sequence_metadata_json(input_file, json_file):
+                            raise Exception("Failed to build sequence metadata")
+                    elif not parse_with_cpp(input_file, json_file, analysis_mode=analysis_mode):
+                        raise Exception("Failed to parse genome data")
 
-                uploaded_outputs = {}
-                uploaded_outputs['raw'] = f"s3://{OUTPUT_BUCKET}/{raw_key}"
-                dataset_keys = ['sequences']
-                if analysis_mode == 'full':
-                    dataset_keys.extend(['patterns', 'regions'])
+                    uploaded_outputs = {}
+                    uploaded_outputs['raw'] = f"s3://{OUTPUT_BUCKET}/{raw_key}"
+                    dataset_keys = ['sequences']
+                    if analysis_mode == 'full':
+                        dataset_keys.extend(['patterns', 'regions'])
 
-                for dataset_key in dataset_keys:
-                    parquet_file = parquet_files[dataset_key]
-                    if not convert_to_parquet(json_file, parquet_file, dataset_key=dataset_key):
-                        continue
+                    for dataset_key in dataset_keys:
+                        parquet_file = parquet_files[dataset_key]
+                        if not convert_to_parquet(json_file, parquet_file, dataset_key=dataset_key):
+                            continue
 
-                    s3_key = build_output_key(job_event, source, dataset_key=dataset_key)
-                    if not upload_to_s3(parquet_file, OUTPUT_BUCKET, s3_key):
-                        raise Exception(f"Failed to upload {dataset_key} output to S3")
-                    uploaded_outputs[dataset_key] = f"s3://{OUTPUT_BUCKET}/{s3_key}"
+                        s3_key = build_output_key(job_event, source, dataset_key=dataset_key)
+                        if not upload_to_s3(parquet_file, OUTPUT_BUCKET, s3_key):
+                            raise Exception(f"Failed to upload {dataset_key} output to S3")
+                        register_glue_partition(dataset_key, OUTPUT_BUCKET, s3_key)
+                        uploaded_outputs[dataset_key] = f"s3://{OUTPUT_BUCKET}/{s3_key}"
 
-                if 'sequences' not in uploaded_outputs:
-                    raise Exception("Failed to produce sequence Parquet output")
+                    if 'sequences' not in uploaded_outputs:
+                        raise Exception("Failed to produce sequence Parquet output")
 
-                results.append({
-                    'output_location': uploaded_outputs['sequences'],
-                    'analysis_outputs': uploaded_outputs,
-                    'source': source,
-                    'chromosome': derive_chromosome_label(job_event),
-                    'analysis_mode': analysis_mode,
-                })
-
-                # Kick off async partition add + cache invalidation
-                trigger_partition_repair(
-                    {k: v for k, v in uploaded_outputs.items() if k in DATASET_TABLE_MAP},
-                    chromosome=derive_chromosome_label(job_event),
+                    record_success(job_event, backend, outputs=uploaded_outputs)
+                    results.append({
+                        'output_location': uploaded_outputs['sequences'],
+                        'analysis_outputs': uploaded_outputs,
+                        'source': source,
+                        'chromosome': derive_chromosome_label(job_event),
+                        'analysis_mode': analysis_mode,
+                    })
+            except Exception as exc:
+                record_failure(
+                    job_event,
+                    backend,
+                    failure_reason=str(exc),
+                    error_type=exc.__class__.__name__,
                 )
+                raise
 
         return {
             'statusCode': 200,

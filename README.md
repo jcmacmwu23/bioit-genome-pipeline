@@ -1,328 +1,190 @@
-# BioIT Genome Intelligence Pipeline
+# BioIT Genome Pipeline
 
-An end-to-end AWS data engineering project that pulls human reference genome sequences from the NCBI API, processes them through a high-performance C++ FASTA/FASTQ parser, stores results in an S3 data lake as Parquet, and surfaces the analysis through an interactive web dashboard.
+AWS-based genome ingestion, C++ sequence analysis, Athena-ready data lake outputs, and a live dashboard for chromosome-level review.
 
----
+## What This Project Does
 
-## Architecture
+This project pulls human chromosome reference sequences, processes them with a high-performance C++ parser, stores partitioned Parquet datasets in S3, and exposes both:
 
-```
-NCBI Entrez API
-      │
-      ▼
-AWS Lambda / AWS Batch on Fargate
-  ├── Download FASTA  (S3 reuse or NCBI stream)
-  ├── C++ FASTA parser  (g++ -O3, deployed as Lambda layer or Docker image)
-  │     ├── GC content & base composition per sequence
-  │     ├── Motif detection  (start codons, CpG hotspots, GATA motifs, …)
-  │     ├── Candidate ORF detection  (3 reading frames × both strands)
-  │     └── Sliding-window region summaries (100 kb windows)
-  └── Parquet → S3 data lake
-            │
-            ├── genome_data/      (sequence-level metrics)
-            ├── pattern_data/     (per-hit motif & ORF positions)
-            └── region_data/      (windowed GC, ORF density, CpG density)
-                     │
-              AWS Glue Catalog  ──  MSCK REPAIR auto-triggered post-job
-                     │
-              Amazon Athena
-                     │
-         API Gateway  →  Python Lambda (web_api_handler.py)
-                     │          │
-                     │    DynamoDB cache  (sub-ms reads on cache hit)
-                     │          │
-                     │   CloudFront CDN  (edge caching, HTTPS)
-                     │
-              S3 Static Website  ←  CloudFront CDN
-                     │
-         Interactive Dashboard  (vanilla JS + SVG, no framework)
-```
+- analytics tables in Athena
+- operational status through a web API
+- a CloudFront-hosted dashboard for chromosome monitoring and visualization
 
-### Compute routing by chromosome size
+The current production workflow is optimized for full-chromosome analysis and routes full-analysis jobs through AWS Batch on Fargate.
 
-| Chromosome size | Backend | Reason |
-|---|---|---|
-| ≤ 60 Mb (chr19–22, Y) | AWS Lambda | Fits within 15-min / 3 GB ceiling |
-| > 60 Mb (chr1–18, X) | AWS Batch on Fargate | No timeout, up to 32 GB RAM |
+## Current Architecture
 
----
-
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Sequence source | NCBI Entrez API (streaming download) |
-| FASTA parsing | C++17 with nlohmann/json, compiled per-platform |
-| Compute | AWS Lambda (Python 3.11), AWS Batch on Fargate |
-| Storage | Amazon S3 (Parquet + Snappy), S3 static website |
-| Catalog | AWS Glue, Amazon Athena |
-| Caching | Amazon DynamoDB (API response cache, sub-ms reads) |
-| CDN / HTTPS | Amazon CloudFront (API + dashboard, edge caching) |
-| Job queuing | Amazon SQS |
-| Orchestration | AWS Step Functions |
-| API | Amazon API Gateway HTTP → Python Lambda |
-| Dashboard | Vanilla JS + inline SVG (no framework dependency) |
-| Infrastructure | Terraform |
-
----
-
-## API Performance Architecture
-
-API responses go through three layers to minimise Athena query latency:
-
-```
-Browser request
-    ↓
-CloudFront edge cache  →  ~0ms (within TTL)
-    ↓ miss
-API Gateway  →  Lambda (kept warm by EventBridge ping every 5 min)
-    ↓
-DynamoDB cache         →  ~1ms (on cache hit)
-    ↓ miss
-Amazon Athena          →  ~5–7s (first request only)
-    ↓
-Write result to DynamoDB (TTL per endpoint)
+```text
+NCBI / Ensembl
+      |
+      v
+  SQS job queue / dashboard API submit
+      |
+      v
+AWS Lambda
+  - sequence-only ingestion
+  - lightweight orchestration
+      |
+      +--------------------------+
+                                 |
+                                 v
+                      AWS Batch on Fargate
+                      - full chromosome analysis
+                      - C++ parser execution
+                      - pattern detection
+                      - region summaries
+                                 |
+                                 v
+                           S3 data lake
+                  genome_data / pattern_data / region_data
+                                 |
+                +----------------+----------------+
+                |                                 |
+                v                                 v
+            Athena / Glue                  Dashboard API + DDB
+                                           + CloudFront dashboard
 ```
 
-**Cache TTLs**
+## Main Outputs
 
-| Endpoint | CloudFront TTL | DynamoDB TTL |
-|---|---|---|
-| `/api/status/overview` | 30 s | 30 s |
-| `/api/chromosomes` | 2 min | 2 min |
-| `/api/chromosomes/{chr}/summary` | 5 min | 5 min |
-| `/api/chromosomes/{chr}/patterns` | 1 hr | 1 hr |
-| `/api/chromosomes/{chr}/regions` | 1 hr | 1 hr |
-| POST endpoints | no cache | no cache |
+The pipeline writes partitioned Parquet datasets to S3:
 
-**Cache invalidation after analysis**
+- `genome_data/`
+  - sequence-level records
+- `pattern_data/`
+  - motif, repeat, and candidate ORF hits
+- `region_data/`
+  - windowed GC, ORF, motif, and repeat summaries
+- `gene_annotation_data/`
+  - annotation-derived gene features when loaded
 
-When a Batch job completes, `trigger_partition_repair()` in `lambda_handler.py` automatically:
-1. Runs `MSCK REPAIR TABLE` for each updated Glue table (Athena partition sync)
-2. Deletes DynamoDB cache entries for the chromosome (`CHR#{n}#*`, `CHROMOSOMES`, `OVERVIEW`)
-3. Creates a CloudFront invalidation for `/api/chromosomes` and `/api/chromosomes/{chr}/*`
+Partition structure:
 
-This ensures the dashboard reflects new analysis data within seconds of job completion, without waiting for TTLs to expire.
+```text
+source=<source>/species=<species>/chr=<chromosome>/year=<YYYY>/month=<MM>/
+```
 
----
+## AWS Components
 
-## Dashboard Features
+- AWS Batch on Fargate for full-chromosome analysis
+- Lambda for ingestion, queue handling, and web API routes
+- SQS for job submission
+- S3 for the data lake and frontend hosting
+- Athena and Glue for analytics
+- DynamoDB for operational job status tracking
+- CloudFront for dashboard delivery
+- CloudWatch Logs for runtime debugging
 
-- **24-chromosome completion map** — pill grid, clickable; green = full analysis complete
-- **Chromosome atlas** — all 24 bars scaled by reference length, click any bar to select
-- **Selected chromosome lens**
-  - Ideogram colored by ORF density gradient (beige → purple)
-  - Analysis window track: GC-colored 100 kb windows with motif dots and ORF flags
-  - CpG motif density track across the full chromosome
-  - Click-to-zoom: fetches individual ORF positions + CpG sites from Athena for the selected region
-  - ← Zoom out to return to full view
-- **Pattern leaderboard** — top motifs by total hit count per chromosome
-- **Real-time Batch progress** — elapsed time, estimated % complete, and ETA while a job runs
-- **Safe job submission** — single-chromosome and full 24-chromosome batch forms
+## Dashboard and API
 
----
+Live environment in this project:
 
-## Prerequisites
+- Dashboard: [CloudFront dashboard](https://d11q5vlaasogkc.cloudfront.net/)
+- API base: `https://7e4jzpfr2d.execute-api.us-east-1.amazonaws.com`
 
-- AWS account with IAM permissions for Lambda, Batch, S3, Glue, Athena, SQS, ECR, Step Functions
-- AWS CLI configured (`aws configure`)
-- Terraform ≥ 1.0
-- Python 3.11+
-- g++ with C++17 support (**Linux x86_64** required for Lambda/Batch)
-- Docker (for rebuilding the Batch container image on macOS/ARM)
+The dashboard supports:
 
----
+- chromosome completion tracking
+- Batch/Athena progress messaging
+- ideogram-style chromosome atlas
+- selected chromosome lens
+- candidate ORF and CpG density views
+- pattern and region summaries
 
-## Deployment
+## Athena Tables
 
-### 1. Clone and build
+Database:
+
+- `genome_pipeline_db`
+
+Core tables:
+
+- `genome_sequences`
+- `sequence_patterns`
+- `sequence_regions`
+- `gene_annotations`
+
+Important:
+
+- In Athena Query Editor, switch the database to `genome_pipeline_db`
+- If partitions are newly written, run `MSCK REPAIR TABLE <table_name>` when needed
+
+## Build and Deploy
+
+### Prerequisites
+
+- AWS CLI configured
+- Terraform installed
+- Python 3.11
+- Docker or Colima for Batch image work when needed
+- `make`
+
+### Local build
 
 ```bash
-git clone <repo-url>
-cd bioproject-files
-
-# Build Lambda layer (Linux C++ binary + Python deps) and function zips
+make build-web-api
+make build-function
+make build-layer
 make build
 ```
 
-> **macOS note:** The C++ parser must be a Linux ELF binary.
-> Use Docker (`--platform linux/amd64`) or AWS CodeBuild (`buildspec.batch-image.yml`).
-
-### 2. Deploy infrastructure
+### Terraform deploy
 
 ```bash
 cd dist/terraform
 terraform init
-terraform apply -var='ncbi_email=your@email.com'
+terraform plan
+terraform apply
 ```
 
-### 3. Configure the dashboard
+## Common Workflows
 
-```bash
-cp webapp/config.js.example webapp/config.js
-# Set window.BIOIT_API_BASE_URL to the API Gateway URL from Terraform output
-```
+### Sequence-only ingestion
 
-### 4. Build and push the Batch container image
+Use sequence-only when you want to land the chromosome first without running the full region/pattern analysis path immediately.
 
-```bash
-ECR_URI=$(terraform output -raw batch_runner_repository_url)
+### Full analysis
 
-aws ecr get-login-password --region us-east-1 | \
-  docker login --username AWS --password-stdin $ECR_URI
+Full-chromosome analysis is Batch-first in the current system.
 
-docker build --platform linux/amd64 -t batch-runner -f Dockerfile.batch .
-docker tag batch-runner:latest ${ECR_URI}:latest
-docker push ${ECR_URI}:latest
-```
+- dashboard button submits full analysis
+- web API submits Batch jobs
+- DynamoDB stores progress and completion state
+- Athena-backed summary views load after outputs land
 
----
+### Queue submission
 
-## Running the Pipeline
+Prefer the project client or JSON file submission over hand-built shell JSON.
 
-### Ingest all 24 chromosomes (sequence-only, uses Lambda)
+See:
 
-```bash
-curl -X POST https://<api>/api/jobs/human-reference \
-  -H "Content-Type: application/json" \
-  -d '{"species": "homo_sapiens", "analysis_mode": "sequence_only"}'
-```
+- [QUICKSTART.md](QUICKSTART.md)
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
 
-### Promote a chromosome to full analysis (Batch for large chromosomes)
+## Project Docs
 
-From the dashboard: select a chromosome → **Run Full Analysis on Batch**.
+Recommended starting points:
 
-Or via API:
+- [README.md](README.md)
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
+- [PROJECT_WORK_SUMMARY.md](PROJECT_WORK_SUMMARY.md)
 
-```bash
-curl -X POST https://<api>/api/chromosomes/1/analyze \
-  -H "Content-Type: application/json" \
-  -d '{"species": "homo_sapiens"}'
-```
+## Notes on Biological Scope
 
-The API automatically:
-- Looks up the existing raw FASTA in S3 to avoid re-downloading from NCBI
-- Routes to Lambda (small chromosomes) or Batch (large chromosomes)
-- Triggers `MSCK REPAIR TABLE` on completion so Athena sees results immediately
+Current gene-like detection in the analysis path is based on candidate ORFs and pattern heuristics, not authoritative annotation alone.
 
----
+For biologically stronger gene identification:
 
-## Live Demo
+- ingest Ensembl or NCBI annotations
+- keep `gene_annotations` queryable
+- join annotations with `sequence_patterns` and `sequence_regions`
 
-**[https://d11q5vlaasogkc.cloudfront.net](https://d11q5vlaasogkc.cloudfront.net)**
+## Status
 
-Hosted on AWS S3 + CloudFront (HTTPS). No login required.
+As of June 6, 2026, the project has:
 
----
-
-## Accessing the Dashboard
-
-After deployment, Terraform outputs the HTTPS URL:
-
-```
-dashboard_https_url    = https://d<id>.cloudfront.net      ← share this
-dashboard_api_endpoint = https://<api-id>.execute-api.<region>.amazonaws.com
-```
-
-Open the **dashboard_https_url** in a browser. No login required.
-
-> **First-time setup:** copy `webapp/config.js.example` to `webapp/config.js`, set
-> `window.BIOIT_API_BASE_URL` to your `dashboard_api_endpoint`, then re-upload `config.js` to the S3
-> dashboard bucket:
-> ```bash
-> aws s3 cp webapp/config.js s3://<project>-dashboard-<account>/config.js \
->   --content-type "application/javascript"
-> ```
-
----
-
-## Using the Dashboard
-
-### Selecting a chromosome
-
-- **Completion map** (pill grid) — click any numbered pill to load that chromosome
-- **Chromosome atlas** — click any vertical bar in the atlas to select it
-- The status banner updates immediately; data loads within a few seconds
-
-### Understanding the status cards
-
-| Card | Meaning |
-|---|---|
-| **Sequence Status: Ready** | Raw FASTA downloaded and stored in S3 |
-| **Pattern Status: Ready** | Motif & ORF hits computed and queryable in Athena |
-| **Region Status: Ready** | 100 kb windowed summaries (GC, ORF density, CpG) available |
-| **Full Analysis Path: Batch** | Chromosome > 60 Mb — full analysis runs on AWS Batch / Fargate |
-| **Full Analysis Path: Complete** | All three datasets exist for this chromosome |
-
-### Running full analysis
-
-1. Select a chromosome with **Sequence Status: Ready** but patterns/regions pending
-2. Click **Run Full Analysis on Batch** (large chromosomes) or **Run Full Analysis** (small)
-3. The Pattern and Region status cards switch to:
-   > *Running on Batch (8.2 min · ~15% · ETA ~46 min left)*
-4. Progress updates automatically every 30 seconds — no page refresh needed
-5. When the job completes the cards flip to **Ready** and the visualization loads
-
-### Chromosome lens visualization
-
-The **Selected chromosome lens** card shows three layers for the active chromosome:
-
-| Layer | What it shows |
-|---|---|
-| **Ideogram bar** | ORF density gradient — beige (low) → purple (high); red band = centromere |
-| **Analysis window track** | GC-colored 100 kb windows with orange motif dots and purple ORF flags |
-| **CpG motif density** | Teal bar chart of CpG/motif density across the full chromosome |
-
-**Hovering** over the ideogram shows a tooltip: genomic coordinates, ORF count, CpG hits, GC%.
-
-**Clicking** a region zooms in and loads individual ORF positions (purple bars, split by strand) and CpG sites (teal ticks) from Athena.
-
-**← Zoom out** returns to the full chromosome view.
-
-### Submitting a full 24-chromosome batch
-
-Scroll to the **Controls** section → **Full human reference** → **Prepare full batch request** → submit via API.
-
----
-
-## Key Files
-
-| File | Purpose |
-|---|---|
-| `fasta_parser.cpp` | C++ parser — GC content, motifs, ORFs, sliding windows |
-| `lambda_handler.py` | Pipeline core — download, parse, upload, repair partitions |
-| `batch_entrypoint.py` | Batch container entry — reads `JOB_PAYLOAD` env, calls lambda_handler |
-| `web_api_handler.py` | REST API — chromosome status, Athena queries, job submission |
-| `main.tf` | Complete Terraform definition — all AWS resources |
-| `Dockerfile.batch` | Batch image — compiles C++ for Linux, installs Python deps |
-| `buildspec.batch-image.yml` | AWS CodeBuild spec for remote image builds |
-| `webapp/` | Dashboard — HTML + CSS + vanilla JS + SVG |
-| `Makefile` | Build, test, deploy targets |
-
----
-
-## Human Genome Reference
-
-All 24 chromosomes use GRCh38.p14 NCBI RefSeq accessions (NC_000001.11 – NC_000024.10).
-See `web_api_handler.py → HUMAN_CHROMOSOME_ACCESSIONS` for the complete mapping.
-
----
-
-## Estimated Cost (AWS Free Tier)
-
-| Service | Typical one-time cost |
-|---|---|
-| Lambda processing (small chromosomes) | ~$0 (free tier) |
-| Batch / Fargate (chr1–18, X) | ~$0.40–0.55 / chromosome |
-| S3 storage (all 24 chromosomes) | ~$0 (< 5 GB) |
-| Athena queries | Cents per query on Parquet |
-| API Gateway + CloudFront | ~$0 (free tier) |
-| **Full 24-chromosome run** | **~$8–12 total** |
-
-Results persist in S3 — no cost to query after the initial analysis.
-
----
-
-## License
-
-MIT
+- live AWS deployment
+- full human chromosome sequence coverage
+- completed Batch-first full-analysis path
+- live dashboard with operational progress reporting
+- chromosome atlas and lens visualizations

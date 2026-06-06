@@ -81,7 +81,7 @@ aws sts get-caller-identity
 Requires Docker to be running (compiles C++ inside Amazon Linux 2):
 
 ```bash
-cd "/Users/turtlemasterflex/Desktop/ claude output/BioAPI pipeline/bioproject files"
+cd /path/to/bioit-genome-pipeline
 bash build.sh
 ```
 

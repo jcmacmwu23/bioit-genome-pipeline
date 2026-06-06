@@ -98,6 +98,7 @@ mkdir -p "$FUNCTION_DIR"
 
 # Copy Lambda handler
 cp lambda_handler.py "$FUNCTION_DIR/"
+cp operations_store.py "$FUNCTION_DIR/"
 
 # Create function zip
 cd "$FUNCTION_DIR"
@@ -117,6 +118,7 @@ WEB_API_DIR="$BUILD_DIR/web_api"
 mkdir -p "$WEB_API_DIR"
 
 cp web_api_handler.py "$WEB_API_DIR/"
+cp operations_store.py "$WEB_API_DIR/"
 
 cd "$WEB_API_DIR"
 zip -r "$DIST_DIR/web_api_function.zip" . -q

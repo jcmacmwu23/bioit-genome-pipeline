@@ -43,7 +43,7 @@ variable "lambda_memory" {
 variable "ncbi_email" {
   description = "Contact email used for NCBI Entrez requests"
   type        = string
-  default     = "your_email@example.com"
+  default     = "meiwu123@gmail.com"
 }
 
 variable "batch_image_tag" {
@@ -68,6 +68,12 @@ variable "batch_max_vcpus" {
   description = "Maximum vCPUs AWS Batch can scale to in the Fargate compute environment"
   type        = number
   default     = 256
+}
+
+variable "operations_ttl_days" {
+  description = "Retention window in days for DynamoDB operational status records"
+  type        = number
+  default     = 30
 }
 
 # S3 Buckets
@@ -110,6 +116,41 @@ resource "aws_s3_bucket_lifecycle_configuration" "genome_temp" {
     expiration {
       days = 7
     }
+  }
+}
+
+resource "aws_dynamodb_table" "operations_status" {
+  name         = "${var.project_name}-operations"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+  range_key    = "sk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  server_side_encryption {
+    enabled = true
+  }
+
+  tags = {
+    Name        = "Genome Pipeline Operational Status"
+    Environment = "production"
   }
 }
 
@@ -172,13 +213,36 @@ resource "aws_iam_role_policy" "lambda_policy" {
       {
         Effect = "Allow"
         Action = [
+          "glue:GetDatabase",
+          "glue:GetDatabases",
+          "glue:GetTable",
+          "glue:GetTables",
+          "glue:GetPartition",
+          "glue:GetPartitions",
+          "glue:CreatePartition",
+          "glue:BatchCreatePartition"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "athena:StartQueryExecution",
+          "athena:GetQueryExecution"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
           "s3:GetObject",
           "s3:PutObject",
           "s3:DeleteObject"
         ]
         Resource = [
           "${aws_s3_bucket.genome_output.arn}/*",
-          "${aws_s3_bucket.genome_temp.arn}/*"
+          "${aws_s3_bucket.genome_temp.arn}/*",
+          "${aws_s3_bucket.athena_results.arn}/*"
         ]
       },
       {
@@ -188,7 +252,8 @@ resource "aws_iam_role_policy" "lambda_policy" {
         ]
         Resource = [
           aws_s3_bucket.genome_output.arn,
-          aws_s3_bucket.genome_temp.arn
+          aws_s3_bucket.genome_temp.arn,
+          aws_s3_bucket.athena_results.arn
         ]
       },
       {
@@ -205,45 +270,19 @@ resource "aws_iam_role_policy" "lambda_policy" {
         Action = [
           "sqs:ReceiveMessage",
           "sqs:DeleteMessage",
-          "sqs:GetQueueAttributes",
-          "sqs:SendMessage"
+          "sqs:GetQueueAttributes"
         ]
         Resource = aws_sqs_queue.genome_queue.arn
       },
       {
         Effect = "Allow"
         Action = [
-          "athena:StartQueryExecution",
-          "athena:GetQueryExecution"
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:Query"
         ]
-        Resource = "*"
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["cloudfront:CreateInvalidation"]
-        Resource = "*"
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:BatchWriteItem"]
-        Resource = aws_dynamodb_table.api_cache.arn
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject",
-          "s3:PutObject"
-        ]
-        Resource = "${aws_s3_bucket.athena_results.arn}/*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "glue:GetTable",
-          "glue:GetPartitions",
-          "glue:BatchCreatePartition"
-        ]
-        Resource = "*"
+        Resource = aws_dynamodb_table.operations_status.arn
       }
     ]
   })
@@ -277,14 +316,15 @@ resource "aws_lambda_function" "genome_processor" {
 
   environment {
     variables = {
-      OUTPUT_BUCKET          = aws_s3_bucket.genome_output.id
-      TEMP_BUCKET            = aws_s3_bucket.genome_temp.id
-      NCBI_EMAIL             = var.ncbi_email
-      ATHENA_DATABASE        = aws_glue_catalog_database.genome_db.name
-      ATHENA_WORKGROUP       = aws_athena_workgroup.genome_workgroup.name
-      ATHENA_RESULTS_BUCKET  = aws_s3_bucket.athena_results.id
-      API_CF_DISTRIBUTION_ID = aws_cloudfront_distribution.api.id
-      CACHE_TABLE            = aws_dynamodb_table.api_cache.name
+      OUTPUT_BUCKET         = aws_s3_bucket.genome_output.id
+      TEMP_BUCKET           = aws_s3_bucket.genome_temp.id
+      NCBI_EMAIL            = var.ncbi_email
+      GLUE_DATABASE         = aws_glue_catalog_database.genome_db.name
+      ATHENA_DATABASE       = aws_glue_catalog_database.genome_db.name
+      ATHENA_WORKGROUP      = aws_athena_workgroup.genome_workgroup.name
+      ATHENA_RESULTS_BUCKET = aws_s3_bucket.athena_results.id
+      OPERATIONS_TABLE      = aws_dynamodb_table.operations_status.name
+      OPERATIONS_TTL_DAYS   = tostring(var.operations_ttl_days)
     }
   }
 
@@ -380,13 +420,36 @@ resource "aws_iam_role_policy" "batch_job_policy" {
       {
         Effect = "Allow"
         Action = [
+          "glue:GetDatabase",
+          "glue:GetDatabases",
+          "glue:GetTable",
+          "glue:GetTables",
+          "glue:GetPartition",
+          "glue:GetPartitions",
+          "glue:CreatePartition",
+          "glue:BatchCreatePartition"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "athena:StartQueryExecution",
+          "athena:GetQueryExecution"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
           "s3:GetObject",
           "s3:PutObject",
           "s3:DeleteObject"
         ]
         Resource = [
           "${aws_s3_bucket.genome_output.arn}/*",
-          "${aws_s3_bucket.genome_temp.arn}/*"
+          "${aws_s3_bucket.genome_temp.arn}/*",
+          "${aws_s3_bucket.athena_results.arn}/*"
         ]
       },
       {
@@ -396,8 +459,19 @@ resource "aws_iam_role_policy" "batch_job_policy" {
         ]
         Resource = [
           aws_s3_bucket.genome_output.arn,
-          aws_s3_bucket.genome_temp.arn
+          aws_s3_bucket.genome_temp.arn,
+          aws_s3_bucket.athena_results.arn
         ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:Query"
+        ]
+        Resource = aws_dynamodb_table.operations_status.arn
       }
     ]
   })
@@ -482,14 +556,15 @@ resource "aws_batch_job_definition" "full_analysis" {
       }
     }
     environment = [
-      { name = "OUTPUT_BUCKET",          value = aws_s3_bucket.genome_output.id },
-      { name = "TEMP_BUCKET",            value = aws_s3_bucket.genome_temp.id },
-      { name = "NCBI_EMAIL",             value = var.ncbi_email },
-      { name = "ATHENA_DATABASE",        value = aws_glue_catalog_database.genome_db.name },
-      { name = "ATHENA_WORKGROUP",       value = aws_athena_workgroup.genome_workgroup.name },
-      { name = "ATHENA_RESULTS_BUCKET",  value = aws_s3_bucket.athena_results.id },
-      { name = "API_CF_DISTRIBUTION_ID", value = aws_cloudfront_distribution.api.id },
-      { name = "CACHE_TABLE",            value = aws_dynamodb_table.api_cache.name }
+      { name = "OUTPUT_BUCKET", value = aws_s3_bucket.genome_output.id },
+      { name = "TEMP_BUCKET", value = aws_s3_bucket.genome_temp.id },
+      { name = "NCBI_EMAIL", value = var.ncbi_email },
+      { name = "GLUE_DATABASE", value = aws_glue_catalog_database.genome_db.name },
+      { name = "ATHENA_DATABASE", value = aws_glue_catalog_database.genome_db.name },
+      { name = "ATHENA_WORKGROUP", value = aws_athena_workgroup.genome_workgroup.name },
+      { name = "ATHENA_RESULTS_BUCKET", value = aws_s3_bucket.athena_results.id },
+      { name = "OPERATIONS_TABLE", value = aws_dynamodb_table.operations_status.name },
+      { name = "OPERATIONS_TTL_DAYS", value = tostring(var.operations_ttl_days) }
     ]
   })
 }
@@ -620,14 +695,14 @@ resource "aws_iam_role_policy" "web_api_policy" {
         Resource = "*"
       },
       {
-        Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:BatchWriteItem"]
-        Resource = aws_dynamodb_table.api_cache.arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["cloudfront:CreateInvalidation"]
-        Resource = "*"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:Query"
+        ]
+        Resource = aws_dynamodb_table.operations_status.arn
       }
     ]
   })
@@ -654,10 +729,10 @@ resource "aws_lambda_function" "web_api" {
       ATHENA_DATABASE       = aws_glue_catalog_database.genome_db.name
       ATHENA_WORKGROUP      = aws_athena_workgroup.genome_workgroup.name
       ATHENA_RESULTS_BUCKET = aws_s3_bucket.athena_results.id
-      BATCH_JOB_QUEUE        = aws_batch_job_queue.full_analysis.arn
-      BATCH_JOB_DEFINITION   = aws_batch_job_definition.full_analysis.arn
-      CACHE_TABLE            = aws_dynamodb_table.api_cache.name
-      API_CF_DISTRIBUTION_ID = aws_cloudfront_distribution.api.id
+      BATCH_JOB_QUEUE       = aws_batch_job_queue.full_analysis.arn
+      BATCH_JOB_DEFINITION  = aws_batch_job_definition.full_analysis.arn
+      OPERATIONS_TABLE      = aws_dynamodb_table.operations_status.name
+      OPERATIONS_TTL_DAYS   = tostring(var.operations_ttl_days)
     }
   }
 
@@ -740,25 +815,6 @@ resource "aws_lambda_permission" "allow_apigw_dashboard_api" {
   source_arn    = "${aws_apigatewayv2_api.dashboard_api.execution_arn}/*/*"
 }
 
-# ── DynamoDB cache table ─────────────────────────────────────────────────────
-resource "aws_dynamodb_table" "api_cache" {
-  name         = "${var.project_name}-cache"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "pk"
-
-  attribute {
-    name = "pk"
-    type = "S"
-  }
-
-  ttl {
-    attribute_name = "ttl"
-    enabled        = true
-  }
-
-  tags = { Name = "${var.project_name}-api-cache" }
-}
-
 # Static website hosting for dashboard
 resource "aws_s3_bucket" "dashboard_site" {
   bucket = "${var.project_name}-dashboard-${data.aws_caller_identity.current.account_id}"
@@ -828,147 +884,12 @@ resource "aws_s3_object" "dashboard_site_files" {
   )
 }
 
-# ── CloudFront in front of API Gateway ──────────────────────────────────────
-# Custom cache policies — forward query strings so ?start=&end= reach the origin
-
-resource "aws_cloudfront_cache_policy" "api_short" {
-  name        = "${var.project_name}-api-2min"
-  default_ttl = 120
-  max_ttl     = 300
-  min_ttl     = 0
-  parameters_in_cache_key_and_forwarded_to_origin {
-    cookies_config      { cookie_behavior       = "none" }
-    headers_config      { header_behavior       = "none" }
-    query_strings_config { query_string_behavior = "all" }
-  }
-}
-
-resource "aws_cloudfront_cache_policy" "api_long" {
-  name        = "${var.project_name}-api-1hr"
-  default_ttl = 3600
-  max_ttl     = 86400
-  min_ttl     = 0
-  parameters_in_cache_key_and_forwarded_to_origin {
-    cookies_config      { cookie_behavior       = "none" }
-    headers_config      { header_behavior       = "none" }
-    query_strings_config { query_string_behavior = "all" }
-  }
-}
-
-resource "aws_cloudfront_distribution" "api" {
-  enabled     = true
-  price_class = "PriceClass_100"
-
-  origin {
-    domain_name = trimprefix(aws_apigatewayv2_api.dashboard_api.api_endpoint, "https://")
-    origin_id   = "apigw"
-    custom_origin_config {
-      http_port              = 80
-      https_port             = 443
-      origin_protocol_policy = "https-only"
-      origin_ssl_protocols   = ["TLSv1.2"]
-    }
-  }
-
-  # Default — no cache (POST / PUT / DELETE, or anything not matched below)
-  default_cache_behavior {
-    allowed_methods          = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
-    cached_methods           = ["GET", "HEAD"]
-    target_origin_id         = "apigw"
-    viewer_protocol_policy   = "https-only"
-    cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # AWS CachingDisabled
-    origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac" # AllViewerExceptHostHeader
-    compress                 = true
-  }
-
-  # /api/chromosomes — 2-min cache (changes when a new analysis completes)
-  ordered_cache_behavior {
-    path_pattern             = "/api/chromosomes"
-    allowed_methods          = ["GET", "HEAD", "OPTIONS"]
-    cached_methods           = ["GET", "HEAD"]
-    target_origin_id         = "apigw"
-    viewer_protocol_policy   = "https-only"
-    cache_policy_id          = aws_cloudfront_cache_policy.api_short.id
-    origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
-    compress                 = true
-  }
-
-  # /api/chromosomes/*/summary — 5-min cache
-  ordered_cache_behavior {
-    path_pattern             = "/api/chromosomes/*/summary"
-    allowed_methods          = ["GET", "HEAD", "OPTIONS"]
-    cached_methods           = ["GET", "HEAD"]
-    target_origin_id         = "apigw"
-    viewer_protocol_policy   = "https-only"
-    cache_policy_id          = aws_cloudfront_cache_policy.api_short.id
-    origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
-    compress                 = true
-  }
-
-  # /api/chromosomes/*/patterns — 1-hour cache (stable after analysis)
-  ordered_cache_behavior {
-    path_pattern             = "/api/chromosomes/*/patterns"
-    allowed_methods          = ["GET", "HEAD", "OPTIONS"]
-    cached_methods           = ["GET", "HEAD"]
-    target_origin_id         = "apigw"
-    viewer_protocol_policy   = "https-only"
-    cache_policy_id          = aws_cloudfront_cache_policy.api_long.id
-    origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
-    compress                 = true
-  }
-
-  # /api/chromosomes/*/regions — 1-hour cache
-  ordered_cache_behavior {
-    path_pattern             = "/api/chromosomes/*/regions"
-    allowed_methods          = ["GET", "HEAD", "OPTIONS"]
-    cached_methods           = ["GET", "HEAD"]
-    target_origin_id         = "apigw"
-    viewer_protocol_policy   = "https-only"
-    cache_policy_id          = aws_cloudfront_cache_policy.api_long.id
-    origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
-    compress                 = true
-  }
-
-  restrictions {
-    geo_restriction { restriction_type = "none" }
-  }
-  viewer_certificate {
-    cloudfront_default_certificate = true
-  }
-  tags = { Name = "${var.project_name}-api-cdn" }
-}
-
-# ── Lambda keep-warm (EventBridge ping every 5 min — eliminates cold starts) ─
-
-resource "aws_cloudwatch_event_rule" "api_warmup" {
-  name                = "${var.project_name}-api-warmup"
-  description         = "Keep web API Lambda warm to avoid cold starts"
-  schedule_expression = "rate(5 minutes)"
-}
-
-resource "aws_cloudwatch_event_target" "api_warmup" {
-  rule      = aws_cloudwatch_event_rule.api_warmup.name
-  target_id = "warm-web-api"
-  arn       = aws_lambda_function.web_api.arn
-  input     = jsonencode({ "source" = "warmup" })
-}
-
-resource "aws_lambda_permission" "allow_eventbridge_warmup" {
-  statement_id  = "AllowEventBridgeWarmup"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.web_api.function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.api_warmup.arn
-}
-
-# ── config.js now points at CloudFront API URL (HTTPS, cached) ───────────────
-
 resource "aws_s3_object" "dashboard_site_config" {
   bucket       = aws_s3_bucket.dashboard_site.id
   key          = "config.js"
-  content      = "window.BIOIT_API_BASE_URL = 'https://${aws_cloudfront_distribution.api.domain_name}';\n"
+  content      = "window.BIOIT_API_BASE_URL = '${aws_apigatewayv2_api.dashboard_api.api_endpoint}';\n"
   content_type = "application/javascript"
-  etag         = md5("window.BIOIT_API_BASE_URL = 'https://${aws_cloudfront_distribution.api.domain_name}';\n")
+  etag         = md5("window.BIOIT_API_BASE_URL = '${aws_apigatewayv2_api.dashboard_api.api_endpoint}';\n")
 }
 
 # Lambda trigger from SQS
@@ -1901,6 +1822,33 @@ resource "aws_lakeformation_permissions" "lambda_s3_data" {
   }
 }
 
+resource "aws_lakeformation_permissions" "batch_s3_data" {
+  principal   = aws_iam_role.batch_job_role.arn
+  permissions = ["DATA_LOCATION_ACCESS"]
+
+  data_location {
+    arn = aws_s3_bucket.genome_output.arn
+  }
+}
+
+resource "aws_lakeformation_permissions" "lambda_glue_db_alter" {
+  principal   = aws_iam_role.lambda_role.arn
+  permissions = ["ALTER"]
+
+  database {
+    name = aws_glue_catalog_database.genome_db.name
+  }
+}
+
+resource "aws_lakeformation_permissions" "batch_glue_db_alter" {
+  principal   = aws_iam_role.batch_job_role.arn
+  permissions = ["ALTER"]
+
+  database {
+    name = aws_glue_catalog_database.genome_db.name
+  }
+}
+
 # ============================================
 # Data source for current AWS account
 # ============================================
@@ -1958,77 +1906,9 @@ output "dashboard_api_endpoint" {
   description = "HTTP API endpoint for the BioIT dashboard backend"
 }
 
-# CloudFront distribution — HTTPS termination in front of the S3 dashboard bucket
-resource "aws_cloudfront_distribution" "dashboard" {
-  enabled             = true
-  default_root_object = "index.html"
-  price_class         = "PriceClass_100" # North America + Europe only (cheapest)
-
-  origin {
-    domain_name = aws_s3_bucket_website_configuration.dashboard_site.website_endpoint
-    origin_id   = "dashboard-s3-website"
-
-    custom_origin_config {
-      http_port              = 80
-      https_port             = 443
-      origin_protocol_policy = "http-only" # S3 website endpoints are HTTP
-      origin_ssl_protocols   = ["TLSv1.2"]
-    }
-  }
-
-  default_cache_behavior {
-    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
-    cached_methods         = ["GET", "HEAD"]
-    target_origin_id       = "dashboard-s3-website"
-    viewer_protocol_policy = "redirect-to-https"
-
-    forwarded_values {
-      query_string = false
-      cookies { forward = "none" }
-    }
-
-    min_ttl     = 0
-    default_ttl = 0   # Honour no-cache headers from S3 objects
-    max_ttl     = 31536000
-    compress    = true
-  }
-
-  # Return index.html for unknown paths (SPA-style)
-  custom_error_response {
-    error_code         = 403
-    response_code      = 200
-    response_page_path = "/index.html"
-  }
-  custom_error_response {
-    error_code         = 404
-    response_code      = 200
-    response_page_path = "/index.html"
-  }
-
-  restrictions {
-    geo_restriction { restriction_type = "none" }
-  }
-
-  viewer_certificate {
-    cloudfront_default_certificate = true # Free *.cloudfront.net HTTPS cert
-  }
-
-  tags = { Name = "${var.project_name}-dashboard-cdn" }
-}
-
 output "dashboard_website_url" {
   value       = aws_s3_bucket_website_configuration.dashboard_site.website_endpoint
-  description = "S3 static website endpoint (HTTP)"
-}
-
-output "dashboard_https_url" {
-  value       = "https://${aws_cloudfront_distribution.dashboard.domain_name}"
-  description = "CloudFront HTTPS URL for the BioIT dashboard (share this one)"
-}
-
-output "api_cdn_url" {
-  value       = "https://${aws_cloudfront_distribution.api.domain_name}"
-  description = "CloudFront HTTPS URL for the API (cached, no cold starts)"
+  description = "S3 static website endpoint for the BioIT dashboard"
 }
 
 output "batch_job_queue_arn" {

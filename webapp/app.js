@@ -4,12 +4,20 @@ const chromosomeStatus = [
   "17", "18", "19", "20", "21", "22", "X", "Y",
 ].map((chromosome) => ({
   chromosome,
-  ready: true,
+  ready: chromosome === "22" || chromosome === "Y",
   patternsReady: chromosome === "22" || chromosome === "Y",
   regionsReady: chromosome === "22" || chromosome === "Y",
 }));
 
-const chromosomeSummaries = [];
+const chromosomeSummaries = [
+  {
+    chromosome: "22",
+    length: "50.8M bp",
+    gc: "36.2%",
+    patterns: "analysis ready",
+    orfs: "candidate ORFs detected",
+  },
+];
 
 const patternRows = [
   { name: "CpG-like motif", type: "motif", hits: 1482 },
@@ -58,6 +66,9 @@ const CHROMOSOME_MAX_LENGTH = Math.max(...Object.values(HUMAN_CHROMOSOME_LENGTHS
 const VISUAL_BAND_TONES = ["#f4f1eb", "#d9d4cb", "#a49d92", "#5d5955", "#1f1e1c"];
 const CENTROMERE_FILL = "#f46b61";
 const SELECTED_ACCENT = "#7167c7";
+const ATLAS_SELECTED_GLOW = "#e6ff00";
+const ATHENA_SYNC_TYPICAL_SECONDS = 45;
+const ATHENA_SYNC_WARNING_SECONDS = 120;
 
 const singleJobForm = document.getElementById("singleJobForm");
 const payloadPreview = document.getElementById("payloadPreview");
@@ -67,6 +78,7 @@ const summaryCards = document.getElementById("summaryCards");
 const patternTable = document.getElementById("patternTable");
 const orfTable = document.getElementById("orfTable");
 const gcBars = document.getElementById("gcBars");
+const regionChartNote = document.getElementById("regionChartNote");
 const readyChromosomes = document.getElementById("readyChromosomes");
 const queueDepth = document.getElementById("queueDepth");
 const selectedChromosomeLabel = document.getElementById("selectedChromosomeLabel");
@@ -88,15 +100,16 @@ const selectedChromosomeVisualNote = document.getElementById("selectedChromosome
 let activeChromosome = initialChromosomeFromUrl();
 let chromosomeInventory = new Map(chromosomeStatus.map((item) => [item.chromosome, item]));
 let activeSummary = null;
-let activeOrfItems = [];
-let activeCpgItems = [];
-let zoomAbortController = null;
-let isZoomedIn = false; // true while zoomed view is showing — blocks background re-renders
+let batchStatusPollTimer = null;
+let chromosomeDetailsLoading = false;
+const athenaSyncObservedAt = new Map();
 let activePatternItems = patternRows.map((row) => ({
   pattern_name: row.name,
   pattern_type: row.type,
   hit_count: row.hits,
 }));
+let lensFocusRange = null;
+let lensDetailZoom = false;
 let activeRegionItems = orfRows.map((row, index) => {
   const [, range = "0-0"] = row.window.split(":");
   const [start, end] = range.split("-").map((value) => Number(value));
@@ -150,6 +163,17 @@ function formatWindowRange(start, end) {
     return "window unavailable";
   }
   return `${(start / 1000000).toFixed(1)}-${(end / 1000000).toFixed(1)} Mb`;
+}
+
+function formatCompactCoord(bp) {
+  const value = Number(bp || 0);
+  if (value >= 1000000) {
+    return `${(value / 1000000).toFixed(1)} Mb`;
+  }
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(1)} kb`;
+  }
+  return `${Math.round(value)} bp`;
 }
 
 function escapeHtml(value) {
@@ -225,49 +249,6 @@ function buildChromosomeBands(chromosome) {
   return bands;
 }
 
-function formatCoord(bp) {
-  const n = Number(bp);
-  if (n >= 1e6) return `${(n / 1e6).toFixed(2)} Mb`;
-  if (n >= 1e3) return `${(n / 1e3).toFixed(1)} kb`;
-  return `${n} bp`;
-}
-
-function orfDensityColor(intensity) {
-  // background beige (#f8f4ee) → dashboard accent purple (#7167c7)
-  const r = Math.round(248 + intensity * (113 - 248));
-  const g = Math.round(244 + intensity * (103 - 244));
-  const b = Math.round(238 + intensity * (199 - 238));
-  return `rgb(${r},${g},${b})`;
-}
-
-function buildOrfDensityBands(regions, chromosomeLength) {
-  if (!regions.length || !chromosomeLength) return null;
-  const counts = regions.map((r) => Number(r.orf_count || 0));
-  const maxOrf = Math.max(1, ...counts);
-  const minOrf = Math.min(...counts);
-  const orfRange = Math.max(1, maxOrf - minOrf);
-  const centStart = Math.max(0.1, centromereRatio(activeChromosome) - 0.02);
-  const centEnd = Math.min(0.9, centromereRatio(activeChromosome) + 0.02);
-  return regions.map((r) => {
-    const start = Number(r.window_start) / chromosomeLength;
-    const end = Math.min(1, Number(r.window_end) / chromosomeLength);
-    const count = Number(r.orf_count || 0);
-    const inCentromere = start >= centStart && end <= centEnd + 0.001;
-    const intensity = (count - minOrf) / orfRange;
-    return {
-      start,
-      end,
-      fill: inCentromere ? CENTROMERE_FILL : orfDensityColor(intensity),
-      stroke: inCentromere ? "#b63f37" : "rgba(113,103,199,0.22)",
-      orfCount: count,
-      motifHits: Number(r.motif_hits || 0),
-      gcContent: Number(r.gc_content || 0),
-      windowStart: Number(r.window_start),
-      windowEnd: Number(r.window_end),
-    };
-  });
-}
-
 function gcColor(gcValue) {
   const gc = Number(gcValue || 0);
   if (gc >= 55) {
@@ -282,33 +263,29 @@ function gcColor(gcValue) {
   return "#d98752";
 }
 
-function setSelectedChromosome(chromosome) {
-  activeChromosome = chromosome;
-  selectedChromosomeLabel.textContent = chromosome;
-  singleJobForm.elements.chromosome.value = chromosome;
-  const url = new URL(window.location.href);
-  url.searchParams.set("chr", chromosome);
-  window.history.replaceState({}, "", url);
-  renderChromosomeGrid();
-  renderChromosomeAtlas();
-  renderSelectedChromosomeVisual();
-}
+function buildLensRegionSample(items, maxCount = 24) {
+  if (!items.length) {
+    return [];
+  }
 
-function buildOverviewRegionSample(items, maxCount = 72) {
-  const sorted = items
-    .slice()
-    .sort((a, b) => Number(a.window_start || 0) - Number(b.window_start || 0));
+  const informative = items.filter((item) => {
+    const gc = Number(item.gc_content || 0);
+    const orfs = Number(item.orf_count || 0);
+    const motifs = Number(item.motif_hits || 0);
+    return gc > 0 || orfs > 0 || motifs > 0;
+  });
 
-  if (sorted.length <= maxCount) {
-    return sorted;
+  const source = informative.length ? informative : items;
+  if (source.length <= maxCount) {
+    return source;
   }
 
   const sample = [];
   const seenStarts = new Set();
-  const step = (sorted.length - 1) / (maxCount - 1);
+  const step = (source.length - 1) / (maxCount - 1);
 
   for (let index = 0; index < maxCount; index += 1) {
-    const picked = sorted[Math.round(index * step)];
+    const picked = source[Math.round(index * step)];
     const start = Number(picked.window_start || 0);
     if (seenStarts.has(start)) {
       continue;
@@ -320,15 +297,136 @@ function buildOverviewRegionSample(items, maxCount = 72) {
   return sample;
 }
 
+function densityScale(value, maxValue, minSize = 10, maxSize = 72) {
+  const safeMax = Math.max(1, Number(maxValue || 0));
+  const safeValue = Math.max(0, Number(value || 0));
+  return minSize + ((safeValue / safeMax) * (maxSize - minSize));
+}
+
+function lensAxisLabel(value, detailZoom = false) {
+  if (detailZoom) {
+    return formatCompactCoord(value);
+  }
+  return `${(Number(value || 0) / 1000000).toFixed(1)} Mb`;
+}
+
+function buildLensIdeogramBands(chromosome) {
+  return buildChromosomeBands(chromosome).map((band) => {
+    if (band.fill === CENTROMERE_FILL) {
+      return band;
+    }
+    return {
+      ...band,
+      fill: "#d7d2c8",
+      stroke: "rgba(24, 34, 45, 0.14)",
+    };
+  });
+}
+
+function buildFocusedLensRegionSample(items, maxCount = 24) {
+  if (!items.length) {
+    return [];
+  }
+
+  if (!lensFocusRange) {
+    return buildLensRegionSample(items, maxCount);
+  }
+
+  const startBound = Number(lensFocusRange.start || 0);
+  const endBound = Number(lensFocusRange.end || 0);
+  const overlapping = items.filter((item) => {
+    const start = Number(item.window_start || 0);
+    const end = Number(item.window_end || 0);
+    return end >= startBound && start <= endBound;
+  });
+
+  if (overlapping.length) {
+    return buildLensRegionSample(overlapping, maxCount);
+  }
+
+  const center = (startBound + endBound) / 2;
+  const nearest = items
+    .slice()
+    .sort((a, b) => {
+      const aCenter = (Number(a.window_start || 0) + Number(a.window_end || 0)) / 2;
+      const bCenter = (Number(b.window_start || 0) + Number(b.window_end || 0)) / 2;
+      return Math.abs(aCenter - center) - Math.abs(bCenter - center);
+    })
+    .slice(0, maxCount);
+
+  return buildLensRegionSample(nearest, maxCount);
+}
+
+function setSelectedChromosome(chromosome) {
+  activeChromosome = chromosome;
+  lensFocusRange = null;
+  lensDetailZoom = false;
+  selectedChromosomeLabel.textContent = chromosome;
+  singleJobForm.elements.chromosome.value = chromosome;
+  const url = new URL(window.location.href);
+  url.searchParams.set("chr", chromosome);
+  window.history.replaceState({}, "", url);
+  renderChromosomeGrid();
+  renderChromosomeAtlas();
+  renderSelectedChromosomeVisual();
+}
+
+function showLoadingChromosome(chromosome) {
+  chromosomeDetailsLoading = true;
+  selectedChromosomeLabel.textContent = chromosome;
+  selectedChromosomeStatus.textContent = `Loading live analysis for chromosome ${chromosome}...`;
+  selectedSequenceStatus.textContent = "Loading";
+  selectedPatternStatus.textContent = "Loading";
+  selectedRegionStatus.textContent = "Loading";
+  selectedFullAnalysisStatus.textContent = "Loading";
+  selectedSequenceDetail.textContent = "Fetching sequence summary from the dashboard API...";
+  selectedPatternDetail.textContent = "Checking pattern analysis status...";
+  selectedRegionDetail.textContent = "Checking region analysis status...";
+  selectedFullAnalysisDetail.textContent = "Determining the active analysis path...";
+  runFullAnalysisHint.textContent = `Loading chromosome ${chromosome} status...`;
+  chromosomeSummaries.length = 0;
+  chromosomeSummaries.push({
+    chromosome,
+    length: "Loading...",
+    gc: "Loading...",
+    patterns: "Loading from dashboard API...",
+    orfs: "Loading from dashboard API...",
+  });
+  patternRows.length = 0;
+  orfRows.length = 0;
+  gcValues.length = 0;
+  activePatternItems = [];
+  activeRegionItems = [];
+  renderSummaryCards();
+  renderPatternTable();
+  renderOrfTable();
+  renderGcBars();
+  renderChromosomeGrid();
+  renderChromosomeAtlas();
+  renderSelectedChromosomeVisual();
+}
+
 function selectedChromosomeMessage(item) {
+  if (isAthenaSyncPending(item)) {
+    return "Sequence landed. Batch finished, and Athena is still loading pattern and region summaries.";
+  }
+  if (hasTrackedProcessing(item)) {
+    return formatTrackedProgressDetail(item, "Full analysis") || "Full analysis is active.";
+  }
+  if (item && item.batchStatus && item.batchStatus.status === "FAILED") {
+    return "Full analysis failed on AWS Batch. Open the job controls or retry after checking the Batch logs.";
+  }
+  if (hasBatchProgress(item)) {
+    return formatBatchProgressDetail(item, "Full analysis") || "Full analysis is active on AWS Batch.";
+  }
   if (item.ready && item.patternsReady && item.regionsReady) {
     return "Live sequence, pattern, and region analysis loaded";
   }
   if (item.ready && item.fullAnalysisStatus === "batch_required") {
     return "Sequence landed. This chromosome will use AWS Batch on Fargate for full analysis.";
   }
-  if (item.ready && item.fullAnalysisEligible === false && item.fullAnalysisStatus === "too_large") {
-    return "Sequence landed. This chromosome is too large for the current Lambda full-analysis runtime.";
+  if (item.ready && item.fullAnalysisEligible === false && item.fullAnalysisStatus === "batch_unavailable") {
+    return "Sequence landed, but AWS Batch is not available for full analysis right now.";
   }
   if (item.ready) {
     return "Sequence landed, but some analysis datasets are still pending";
@@ -360,23 +458,209 @@ function statusLabel(isReady) {
   return isReady ? "Ready" : "Pending";
 }
 
-function formatBatchProgress(bs) {
-  if (!bs || bs.status === "no_job" || bs.status === "not_configured") return null;
-  const { status, elapsed_minutes, progress_pct, expected_minutes } = bs;
-  if (status === "SUCCEEDED") return "Batch job completed — refresh to load results.";
-  if (status === "FAILED") return "Batch job failed. Check CloudWatch logs.";
-  if (status === "RUNNING") {
-    const elapsed = elapsed_minutes ? `${elapsed_minutes} min` : "";
-    const pct = progress_pct != null ? ` · ~${progress_pct}%` : "";
-    const eta = progress_pct != null && expected_minutes && elapsed_minutes
-      ? ` · ETA ~${Math.max(0, Math.round(expected_minutes - elapsed_minutes))} min left`
-      : "";
-    return `Running on Batch${elapsed ? ` (${elapsed}${pct}${eta})` : ""}`;
+function hasBatchProgress(item) {
+  if (!item || !item.batchStatus) {
+    return false;
   }
-  if (status === "STARTING") return "Batch container starting…";
-  if (status === "RUNNABLE") return "Batch job queued — waiting for Fargate capacity…";
-  if (status === "SUBMITTED" || status === "PENDING") return "Batch job submitted…";
-  return `Batch: ${status}`;
+  return ["SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING", "SUCCEEDED", "FAILED"].includes(item.batchStatus.status);
+}
+
+function currentTrackedProcessing(item) {
+  if (!item || !item.processingStatus) {
+    return null;
+  }
+  return item.processingStatus;
+}
+
+function hasTrackedProcessing(item) {
+  const status = currentTrackedProcessing(item);
+  return Boolean(status && ["submitted", "running", "failed"].includes(String(status.status || "").toLowerCase()));
+}
+
+function hasResolvedAnalysisMetrics(item) {
+  return Number((item && item.patternHitCount) || 0) > 0 || Number((item && item.orfCount) || 0) > 0;
+}
+
+function isBatchSizedChromosome(item) {
+  if (!item) {
+    return false;
+  }
+  const length = Number(item.sequenceLength || 0);
+  const maxBases = Number(item.fullAnalysisMaxBases || 0);
+  return length > 0 && maxBases > 0 && length > maxBases;
+}
+
+function trackAthenaSyncState(item) {
+  if (!item || !item.chromosome) {
+    return;
+  }
+  if (isAthenaSyncPending(item)) {
+    if (!athenaSyncObservedAt.has(item.chromosome)) {
+      athenaSyncObservedAt.set(item.chromosome, Date.now());
+    }
+    return;
+  }
+  athenaSyncObservedAt.delete(item.chromosome);
+}
+
+function isAthenaSyncPending(item) {
+  if (!item) {
+    return false;
+  }
+  return item.ready
+    && item.patternsReady
+    && item.regionsReady
+    && (item.fullAnalysisBackend === "batch" || isBatchSizedChromosome(item))
+    && !hasResolvedAnalysisMetrics(item);
+}
+
+function formatAthenaSyncDetail(item, analysisKind) {
+  if (!isAthenaSyncPending(item)) {
+    return null;
+  }
+
+  trackAthenaSyncState(item);
+  const observedAt = athenaSyncObservedAt.get(item.chromosome) || Date.now();
+  const elapsedSeconds = Math.max(0, Math.round((Date.now() - observedAt) / 1000));
+  const elapsedLabel = elapsedSeconds >= 60
+    ? `${Math.max(1, Math.round(elapsedSeconds / 60))} min elapsed`
+    : `${elapsedSeconds}s elapsed`;
+
+  if (elapsedSeconds < ATHENA_SYNC_TYPICAL_SECONDS) {
+    return `${analysisKind} is loading from Athena (${elapsedLabel} · typical remaining: under 1 min).`;
+  }
+  if (elapsedSeconds < ATHENA_SYNC_WARNING_SECONDS) {
+    return `${analysisKind} is still loading from Athena (${elapsedLabel} · typical remaining: about 1 min).`;
+  }
+  return `${analysisKind} is taking longer than usual in Athena (${elapsedLabel}). If this keeps going, it is likely a partition refresh issue rather than compute time.`;
+}
+
+function athenaSyncSeverity(item) {
+  if (!isAthenaSyncPending(item)) {
+    return null;
+  }
+  trackAthenaSyncState(item);
+  const observedAt = athenaSyncObservedAt.get(item.chromosome) || Date.now();
+  const elapsedSeconds = Math.max(0, Math.round((Date.now() - observedAt) / 1000));
+  if (elapsedSeconds < ATHENA_SYNC_TYPICAL_SECONDS) {
+    return "normal";
+  }
+  if (elapsedSeconds < ATHENA_SYNC_WARNING_SECONDS) {
+    return "slow";
+  }
+  return "stalled";
+}
+
+function isBatchJobActive(item) {
+  if (!item || !item.batchStatus) {
+    return false;
+  }
+  return ["SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"].includes(item.batchStatus.status);
+}
+
+function isTrackedProcessingActive(item) {
+  const status = currentTrackedProcessing(item);
+  return Boolean(status && ["submitted", "running"].includes(String(status.status || "").toLowerCase()));
+}
+
+function formatTrackedProgressDetail(item, analysisKind) {
+  const status = currentTrackedProcessing(item);
+  if (!status) {
+    return null;
+  }
+
+  const backendLabel = String(status.backend || "lambda").toLowerCase() === "batch"
+    ? "AWS Batch"
+    : "Lambda";
+  const phase = String(status.status || "").toLowerCase();
+  const progress = Number(status.progress_pct || 0);
+  const elapsed = Number(status.elapsed_minutes || 0);
+  const expected = Number(status.expected_minutes || 0);
+  const remaining = expected > elapsed ? Math.max(1, Math.round(expected - elapsed)) : null;
+  const progressLabel = progress > 0 ? `~${progress}%` : null;
+  const elapsedLabel = elapsed > 0 ? `${Math.max(1, Math.round(elapsed))} min elapsed` : null;
+  const etaLabel = remaining ? `ETA ~${remaining} min` : null;
+  const detailBits = [progressLabel, elapsedLabel, etaLabel].filter(Boolean).join(" · ");
+
+  if (phase === "running") {
+    return `${analysisKind} is running on ${backendLabel}${detailBits ? ` (${detailBits})` : ""}.`;
+  }
+  if (phase === "submitted") {
+    return `${analysisKind} was submitted to ${backendLabel}${detailBits ? ` (${detailBits})` : ""}.`;
+  }
+  if (phase === "failed") {
+    return `${analysisKind} failed on ${backendLabel}${status.failure_reason ? ` (${status.failure_reason})` : ""}.`;
+  }
+  if (phase === "succeeded") {
+    return `${analysisKind} finished on ${backendLabel}.`;
+  }
+  return null;
+}
+
+function formatBatchProgressDetail(item, analysisKind) {
+  if (!hasBatchProgress(item)) {
+    return null;
+  }
+
+  const status = item.batchStatus.status;
+  const progress = Number(item.batchStatus.progress_pct || 0);
+  const elapsed = Number(item.batchStatus.elapsed_minutes || 0);
+  const expected = Number(item.batchStatus.expected_minutes || 0);
+  const remaining = expected > elapsed ? Math.max(1, Math.round(expected - elapsed)) : null;
+  const progressLabel = progress > 0 ? `~${progress}%` : null;
+  const elapsedLabel = elapsed > 0 ? `${Math.max(1, Math.round(elapsed))} min elapsed` : null;
+  const etaLabel = remaining ? `ETA ~${remaining} min` : null;
+  const detailBits = [progressLabel, elapsedLabel, etaLabel].filter(Boolean).join(" · ");
+
+  if (status === "RUNNING") {
+    return `${analysisKind} is running on AWS Batch${detailBits ? ` (${detailBits})` : ""}.`;
+  }
+  if (status === "STARTING") {
+    return `${analysisKind} container is starting on AWS Batch${detailBits ? ` (${detailBits})` : ""}.`;
+  }
+  if (status === "RUNNABLE") {
+    return `${analysisKind} is queued on AWS Batch and waiting for Fargate capacity.`;
+  }
+  if (status === "SUBMITTED" || status === "PENDING") {
+    return `${analysisKind} job was submitted to AWS Batch${detailBits ? ` (${detailBits})` : ""}.`;
+  }
+  if (status === "SUCCEEDED") {
+    return `${analysisKind} finished on Batch and Athena is catching up.`;
+  }
+  if (status === "FAILED") {
+    const reason = item.batchStatus.status_reason || "Batch container exited unexpectedly.";
+    return `${analysisKind} failed on AWS Batch (${reason}).`;
+  }
+  return null;
+}
+
+function formatBatchStatusLabel(item, ready) {
+  if (ready || !item || !item.batchStatus) {
+    return statusLabel(ready);
+  }
+  if (item.batchStatus.status === "FAILED") {
+    return "Failed";
+  }
+  const progress = Number(item.batchStatus.progress_pct || 0);
+  if (progress > 0 && isBatchJobActive(item)) {
+    return `${progress}%`;
+  }
+  return statusLabel(false);
+}
+
+function formatTrackedStatusLabel(item, ready) {
+  const status = currentTrackedProcessing(item);
+  if (ready || !status) {
+    return statusLabel(ready);
+  }
+  if (String(status.status || "").toLowerCase() === "failed") {
+    return "Failed";
+  }
+  const progress = Number(status.progress_pct || 0);
+  if (progress > 0 && isTrackedProcessingActive(item)) {
+    return `${progress}%`;
+  }
+  return statusLabel(false);
 }
 
 function latestOutputLabel(item) {
@@ -386,40 +670,82 @@ function latestOutputLabel(item) {
   return `Latest output: ${item.latestOutputAt}`;
 }
 
+function setSelectionCardState(node, state) {
+  const card = node ? node.closest(".selection-card") : null;
+  if (!card) {
+    return;
+  }
+  card.classList.remove("selection-card-sync-normal", "selection-card-sync-slow", "selection-card-sync-stalled");
+  if (state) {
+    card.classList.add(`selection-card-sync-${state}`);
+  }
+}
+
 function updateSelectionMeta(item) {
+  trackAthenaSyncState(item);
+  const syncSeverity = athenaSyncSeverity(item);
+  const trackedProcessingDetail = formatTrackedProgressDetail(item, "Pattern analysis");
+  const trackedRegionDetail = formatTrackedProgressDetail(item, "Region analysis");
   selectedSequenceStatus.textContent = statusLabel(item.ready);
-  selectedPatternStatus.textContent = statusLabel(item.patternsReady);
-  selectedRegionStatus.textContent = statusLabel(item.regionsReady);
+  selectedPatternStatus.textContent = isAthenaSyncPending(item)
+    ? "Syncing"
+    : hasTrackedProcessing(item)
+      ? formatTrackedStatusLabel(item, item.patternsReady)
+    : formatBatchStatusLabel(item, item.patternsReady);
+  selectedRegionStatus.textContent = isAthenaSyncPending(item)
+    ? "Syncing"
+    : hasTrackedProcessing(item)
+      ? formatTrackedStatusLabel(item, item.regionsReady)
+    : formatBatchStatusLabel(item, item.regionsReady);
 
   selectedSequenceDetail.textContent = item.ready
     ? latestOutputLabel(item)
     : "Sequence parquet has not landed in S3 yet";
-  const batchMsg = item.batchStatus ? formatBatchProgress(item.batchStatus) : null;
   selectedPatternDetail.textContent = item.patternsReady
-    ? "Pattern leaderboard is queryable in Athena"
-    : batchMsg || "Pattern analysis has not completed yet";
+    ? isAthenaSyncPending(item)
+      ? formatAthenaSyncDetail(item, "Pattern analysis")
+      : "Pattern leaderboard is queryable in Athena"
+    : trackedProcessingDetail || formatBatchProgressDetail(item, "Pattern analysis") || "Pattern analysis has not completed yet";
   selectedRegionDetail.textContent = item.regionsReady
-    ? "Region windows and GC bars are available"
-    : batchMsg || "Region summaries are not available yet";
+    ? isAthenaSyncPending(item)
+      ? formatAthenaSyncDetail(item, "Region analysis")
+      : "Region windows and GC bars are available"
+    : trackedRegionDetail || formatBatchProgressDetail(item, "Region analysis") || "Region summaries are not available yet";
 
   const fullyAnalyzed = item.patternsReady && item.regionsReady;
   const fullAnalysisEligible = item.fullAnalysisEligible !== false;
-  selectedFullAnalysisStatus.textContent = fullyAnalyzed
+  selectedFullAnalysisStatus.textContent = isAthenaSyncPending(item)
+    ? "Athena"
+    : fullyAnalyzed
     ? "Complete"
+    : hasTrackedProcessing(item)
+      ? formatTrackedStatusLabel(item, false)
     : item.fullAnalysisStatus === "batch_required"
       ? "Batch"
     : fullAnalysisEligible
       ? "Eligible"
       : "Blocked";
-  selectedFullAnalysisDetail.textContent = item.fullAnalysisReason
-    || "Lambda eligibility has not been evaluated yet.";
+  selectedFullAnalysisDetail.textContent = isAthenaSyncPending(item)
+    ? "Batch finished; Athena is still refreshing summary outputs for this chromosome."
+    : hasTrackedProcessing(item)
+      ? formatTrackedProgressDetail(item, "Full analysis") || item.fullAnalysisReason || "Full analysis is active."
+    : item.fullAnalysisReason || "Full-analysis routing has not been evaluated yet.";
+
+  setSelectionCardState(selectedSequenceStatus, null);
+  setSelectionCardState(selectedPatternStatus, syncSeverity);
+  setSelectionCardState(selectedRegionStatus, syncSeverity);
+  setSelectionCardState(selectedFullAnalysisStatus, syncSeverity);
 
   runFullAnalysisButton.disabled = !item.ready || fullyAnalyzed || !fullAnalysisEligible;
   runFullAnalysisButton.textContent = item.fullAnalysisStatus === "batch_required"
     ? "Run Full Analysis on Batch"
     : "Run Full Analysis";
   runFullAnalysisHint.textContent = fullyAnalyzed
-    ? `Chromosome ${item.chromosome} already has full analysis outputs.`
+    ? isAthenaSyncPending(item)
+      ? `Chromosome ${item.chromosome} finished on Batch and is still loading from Athena. Typical sync is under 1 minute.`
+      : `Chromosome ${item.chromosome} already has full analysis outputs.`
+    : hasTrackedProcessing(item)
+      ? formatTrackedProgressDetail(item, "Full analysis") || `Chromosome ${item.chromosome} is currently processing.`
     : !item.ready
       ? `Chromosome ${item.chromosome} needs sequence data before full analysis can run.`
       : !fullAnalysisEligible
@@ -453,12 +779,20 @@ function renderChromosomeAtlas() {
     const clipId = `atlas-clip-${chromosome}`;
     const bands = buildChromosomeBands(chromosome);
     const live = chromosomeState(chromosome);
-    const outline = chromosome === activeChromosome ? SELECTED_ACCENT : "rgba(24, 34, 45, 0.45)";
-    const outlineWidth = chromosome === activeChromosome ? 2.5 : 1.1;
+    const outline = chromosome === activeChromosome ? ATLAS_SELECTED_GLOW : "rgba(24, 34, 45, 0.45)";
+    const outlineWidth = chromosome === activeChromosome ? 3.2 : 1.1;
     const readyFill = live.ready ? "rgba(11, 110, 79, 0.14)" : "rgba(191, 95, 47, 0.12)";
+    const isSelected = chromosome === activeChromosome;
+    const groupOpacity = isSelected ? 1 : 0.42;
 
+    svgParts.push(`<g opacity="${groupOpacity}">`);
     svgParts.push(`<defs><clipPath id="${clipId}"><rect x="${x}" y="${y}" width="${barWidth}" height="${barHeight}" rx="${radius}" ry="${radius}" /></clipPath></defs>`);
-    svgParts.push(`<rect x="${x - 3}" y="${y - 6}" width="${barWidth + 6}" height="${barHeight + 12}" rx="${radius + 4}" fill="${readyFill}" />`);
+    if (isSelected) {
+      svgParts.push(`<rect x="${x - 12}" y="${y - 16}" width="${barWidth + 24}" height="${barHeight + 32}" rx="${radius + 12}" fill="rgba(230,255,0,0.42)" stroke="rgba(230,255,0,0.96)" stroke-width="2.2" />`);
+      svgParts.push(`<rect x="${x - 16}" y="${y - 20}" width="${barWidth + 32}" height="${barHeight + 40}" rx="${radius + 16}" fill="rgba(230,255,0,0.16)" stroke="none" />`);
+    } else {
+      svgParts.push(`<rect x="${x - 3}" y="${y - 6}" width="${barWidth + 6}" height="${barHeight + 12}" rx="${radius + 4}" fill="${readyFill}" />`);
+    }
     svgParts.push(`<rect x="${x}" y="${y}" width="${barWidth}" height="${barHeight}" rx="${radius}" ry="${radius}" fill="#f8f4ee" stroke="${outline}" stroke-width="${outlineWidth}" />`);
 
     bands.forEach((band) => {
@@ -470,94 +804,146 @@ function renderChromosomeAtlas() {
     });
 
     if (live.patternsReady && live.regionsReady) {
-      svgParts.push(`<circle cx="${x + barWidth / 2}" cy="${y + barHeight + 12}" r="3.8" fill="#0b6e4f" />`);
+      svgParts.push(`<circle cx="${x + barWidth / 2}" cy="${y + barHeight + 12}" r="${isSelected ? 5.2 : 3.8}" fill="${isSelected ? "#b7ff00" : "#0b6e4f"}" />`);
     } else if (live.ready) {
-      svgParts.push(`<circle cx="${x + barWidth / 2}" cy="${y + barHeight + 12}" r="3.8" fill="#bf5f2f" />`);
+      svgParts.push(`<circle cx="${x + barWidth / 2}" cy="${y + barHeight + 12}" r="${isSelected ? 5.2 : 3.8}" fill="${isSelected ? "#b7ff00" : "#bf5f2f"}" />`);
     }
 
     svgParts.push(
-      `<text x="${x + barWidth / 2}" y="${height - 14}" text-anchor="middle" fill="${chromosome === activeChromosome ? SELECTED_ACCENT : "#5b6672"}" font-size="12" font-family="Space Grotesk" font-weight="700">${chromosome}</text>`,
+      `<text x="${x + barWidth / 2}" y="${height - 14}" text-anchor="middle" fill="${isSelected ? "#b7ff00" : "#5b6672"}" font-size="${isSelected ? 13.5 : 12}" font-family="Space Grotesk" font-weight="700">${chromosome}</text>`,
     );
-    // Transparent click-capture rect over the full bar column
-    svgParts.push(
-      `<rect x="${x - 3}" y="0" width="${barWidth + 6}" height="${height}" fill="transparent" pointer-events="all" data-chr="${chromosome}" style="cursor:pointer" />`,
-    );
+    svgParts.push(`</g>`);
   });
 
   svgParts.push("</svg>");
   chromosomeAtlas.innerHTML = svgParts.join("");
-
-  // Make each chromosome bar clickable to select that chromosome
-  chromosomeAtlas.querySelectorAll("[data-chr]").forEach((el) => {
-    el.addEventListener("click", () => {
-      const chr = el.getAttribute("data-chr");
-      if (chr) handleChromosomeSelection(chr);
-    });
-  });
 }
 
 function renderSelectedChromosomeVisual() {
+  if (chromosomeDetailsLoading && !activeSummary) {
+    const width = 760;
+    const height = 320;
+    const svgParts = [
+      `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Loading chromosome detail">`,
+      `<rect x="0" y="0" width="${width}" height="${height}" rx="26" fill="rgba(255,255,255,0.5)" />`,
+      `<text x="44" y="56" fill="#18222d" font-size="28" font-family="Space Grotesk" font-weight="700">Chromosome ${activeChromosome}</text>`,
+      `<text x="44" y="86" fill="#5b6672" font-size="16" font-family="IBM Plex Sans">Loading live sequence, pattern, and region detail from the BioIT API...</text>`,
+      `<rect x="44" y="120" width="672" height="30" rx="15" fill="#f8f4ee" stroke="rgba(24,34,45,0.18)" stroke-width="1.2" />`,
+      `<rect x="44" y="120" width="198" height="30" rx="15" fill="rgba(113,103,199,0.18)" />`,
+      `<rect x="44" y="188" width="672" height="96" rx="18" fill="rgba(255,255,255,0.72)" stroke="rgba(24,34,45,0.16)" stroke-width="1.2" />`,
+      `<text x="44" y="178" fill="#bf5f2f" font-size="12" font-family="IBM Plex Sans" font-weight="700">CANDIDATE ORF TRACK</text>`,
+      `<text x="68" y="244" fill="#5b6672" font-size="15" font-family="IBM Plex Sans">Waiting for chromosome detail to load before rendering the lens.</text>`,
+      `</svg>`,
+    ];
+    selectedChromosomeVisual.innerHTML = svgParts.join("");
+    selectedChromosomeVisualNote.textContent = `Chromosome ${activeChromosome} is loading. If this stays here for more than a few seconds, the dashboard API likely returned an error.`;
+    return;
+  }
+
   const item = chromosomeState(activeChromosome);
   const length = chromosomeLengthValue(activeChromosome);
   const patterns = activePatternItems.slice(0, 3);
-  const regions = buildOverviewRegionSample(activeRegionItems);
+  const regions = buildFocusedLensRegionSample(activeRegionItems, 24);
   const width = 760;
-  const height = 456;
+  const controlsActive = Boolean(lensFocusRange);
+  const height = controlsActive ? 658 : 626;
   const ideogramX = 44;
-  const ideogramY = 64;
+  const ideogramY = controlsActive ? 100 : 64;
   const ideogramWidth = 672;
   const ideogramHeight = 30;
   const clipId = `focus-clip-${activeChromosome}`;
-  const orfBands = buildOrfDensityBands(activeRegionItems, length);
-  const bands = orfBands || buildChromosomeBands(activeChromosome);
-  const maxWindowEnd = activeRegionItems.length
-    ? Math.max(...activeRegionItems.map((region) => Number(region.window_end || 0)))
+  const bands = buildLensIdeogramBands(activeChromosome);
+  const maxWindowEnd = regions.length
+    ? Math.max(...regions.map((region) => Number(region.window_end || 0)))
     : 0;
-  const minWindowStart = activeRegionItems.length
-    ? Math.min(...activeRegionItems.map((region) => Number(region.window_start || 0)))
+  const minWindowStart = regions.length
+    ? Math.min(...regions.map((region) => Number(region.window_start || 0)))
     : 0;
   const trackX = 44;
-  const trackY = 196;
+  const trackY = controlsActive ? 232 : 196;
   const trackWidth = 672;
-  const trackHeight = 108;
+  const trackHeight = 104;
+  const motifTrackY = controlsActive ? 424 : 388;
+  const motifTrackHeight = 84;
+  const maxOrfCount = regions.length ? Math.max(...regions.map((region) => Number(region.orf_count || 0))) : 0;
+  const maxMotifHits = regions.length ? Math.max(...regions.map((region) => Number(region.motif_hits || 0))) : 0;
+  const focusStart = lensFocusRange ? Number(lensFocusRange.start || 0) : 0;
+  const focusEnd = lensFocusRange ? Number(lensFocusRange.end || 0) : 0;
+  const focusOrfTotal = regions.reduce((sum, region) => sum + Number(region.orf_count || 0), 0);
+  const focusMotifTotal = regions.reduce((sum, region) => sum + Number(region.motif_hits || 0), 0);
+  const focusAvgGc = regions.length
+    ? (regions.reduce((sum, region) => sum + Number(region.gc_content || 0), 0) / regions.length)
+    : 0;
+  const trackStart = lensDetailZoom && lensFocusRange ? focusStart : 0;
+  const trackEnd = lensDetailZoom && lensFocusRange ? focusEnd : Math.max(length, 1);
+  const trackSpan = Math.max(1, trackEnd - trackStart);
+  const lensTitle = lensDetailZoom && lensFocusRange
+    ? `Zoomed chr${activeChromosome}: ${formatCompactCoord(focusStart)} - ${formatCompactCoord(focusEnd)}`
+    : lensFocusRange
+      ? `Chr${activeChromosome}: ${formatCompactCoord(focusStart)} - ${formatCompactCoord(focusEnd)}`
+    : `Chromosome ${activeChromosome}`;
+  const lensSubtitle = lensFocusRange
+    ? `${regions.length} sampled windows · ${focusOrfTotal.toLocaleString()} ORFs · ${focusMotifTotal.toLocaleString()} motif hits · ${focusAvgGc.toFixed(1)}% avg GC${lensDetailZoom ? " · local detail view" : ""}`
+    : `${formatMb(length)} reference span · ${item.patternsReady ? "patterns ready" : "patterns pending"} · ${item.regionsReady ? "regions ready" : "regions pending"}`;
+  const orfLegendY = trackY - 30;
+  const orfAxisBaselineY = trackY + trackHeight + 18;
+  const motifAxisBottomY = motifTrackY + motifTrackHeight - 10;
+  const motifAxisTopY = motifTrackY + 10;
+  const badgeY = motifAxisBottomY + 48;
+  const badgeTextY = badgeY + 18;
+  const trackTickCount = lensDetailZoom ? 6 : 5;
+  const trackTickValues = Array.from({ length: trackTickCount }, (_, index) => trackStart + ((trackSpan * index) / (trackTickCount - 1)));
+  const orfLegendItems = [
+    { color: "#0b6e4f", label: "GC-rich (>=55%)" },
+    { color: "#4f8f70", label: "GC-high (45-54%)" },
+    { color: "#b7c67d", label: "Balanced GC (38-44%)" },
+    { color: "#d98752", label: "AT-rich (<38%)" },
+  ];
   const svgParts = [
     `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Selected chromosome ideogram and analysis track">`,
     `<rect x="0" y="0" width="${width}" height="${height}" rx="26" fill="rgba(255,255,255,0.5)" />`,
-    `<text x="${ideogramX}" y="34" fill="#18222d" font-size="24" font-family="Space Grotesk" font-weight="700">Chromosome ${activeChromosome}</text>`,
-    `<text x="${ideogramX}" y="52" fill="#5b6672" font-size="13" font-family="IBM Plex Sans">${formatMb(length)} reference span · ${item.patternsReady ? "patterns ready" : "patterns pending"} · ${item.regionsReady ? "regions ready" : "regions pending"}</text>`,
+    `<text x="${ideogramX}" y="34" fill="#18222d" font-size="24" font-family="Space Grotesk" font-weight="700">${lensTitle}</text>`,
+    `<text x="${ideogramX}" y="52" fill="#5b6672" font-size="13" font-family="IBM Plex Sans">${lensSubtitle}</text>`,
     `<defs><clipPath id="${clipId}"><rect x="${ideogramX}" y="${ideogramY}" width="${ideogramWidth}" height="${ideogramHeight}" rx="15" ry="15" /></clipPath></defs>`,
     `<rect x="${ideogramX}" y="${ideogramY}" width="${ideogramWidth}" height="${ideogramHeight}" rx="15" ry="15" fill="#f8f4ee" stroke="rgba(24,34,45,0.4)" stroke-width="1.3" />`,
   ];
 
+  if (controlsActive) {
+    const zoomFill = lensDetailZoom ? "rgba(113,103,199,0.26)" : "rgba(113,103,199,0.14)";
+    svgParts.push(`<rect x="${ideogramX + ideogramWidth - 206}" y="64" width="102" height="24" rx="12" fill="${zoomFill}" stroke="${SELECTED_ACCENT}" stroke-width="1" data-zoom-toggle="true" style="cursor:pointer" />`);
+    svgParts.push(`<text x="${ideogramX + ideogramWidth - 155}" y="80" text-anchor="middle" fill="${SELECTED_ACCENT}" font-size="11" font-family="IBM Plex Sans" font-weight="700" pointer-events="none">ZOOMED VIEW</text>`);
+    svgParts.push(`<rect x="${ideogramX + ideogramWidth - 94}" y="64" width="86" height="24" rx="12" fill="rgba(113,103,199,0.14)" stroke="${SELECTED_ACCENT}" stroke-width="1" data-reset-focus="true" style="cursor:pointer" />`);
+    svgParts.push(`<text x="${ideogramX + ideogramWidth - 51}" y="80" text-anchor="middle" fill="${SELECTED_ACCENT}" font-size="12" font-family="IBM Plex Sans" font-weight="700" pointer-events="none">Reset lens</text>`);
+  }
+
   bands.forEach((band) => {
     const bandX = ideogramX + (band.start * ideogramWidth);
-    const bandWidth = Math.max(2, (band.end - band.start) * ideogramWidth);
-    const dataAttrs = band.windowStart != null
-      ? `class="orf-band" style="cursor:pointer" data-wstart="${band.windowStart}" data-wend="${band.windowEnd}" data-orf="${band.orfCount}" data-motif="${band.motifHits}" data-gc="${band.gcContent}"`
-      : `class="orf-band"`;
+    const bandWidth = Math.max(3, (band.end - band.start) * ideogramWidth);
     svgParts.push(
-      `<rect x="${bandX.toFixed(1)}" y="${ideogramY}" width="${bandWidth.toFixed(1)}" height="${ideogramHeight}" fill="${band.fill}" stroke="${band.stroke}" stroke-width="0.45" clip-path="url(#${clipId})" ${dataAttrs} />`,
+      `<rect x="${bandX}" y="${ideogramY}" width="${bandWidth}" height="${ideogramHeight}" fill="${band.fill}" stroke="${band.stroke}" stroke-width="0.45" clip-path="url(#${clipId})" />`,
     );
   });
-  if (orfBands) {
-    const cr = centromereRatio(activeChromosome);
-    const cx = ideogramX + (cr - 0.02) * ideogramWidth;
-    const cw = Math.max(8, 0.04 * ideogramWidth);
-    svgParts.push(`<rect x="${cx.toFixed(1)}" y="${ideogramY - 2}" width="${cw.toFixed(1)}" height="${ideogramHeight + 4}" rx="5" fill="${CENTROMERE_FILL}" opacity="0.85" clip-path="url(#${clipId})" pointer-events="none" />`);
-  }
 
   if (regions.length && length > 0 && maxWindowEnd > minWindowStart) {
     const highlightStart = ideogramX + (minWindowStart / length) * ideogramWidth;
     const highlightWidth = Math.max(18, ((maxWindowEnd - minWindowStart) / length) * ideogramWidth);
-    svgParts.push(`<rect x="${highlightStart}" y="${ideogramY - 6}" width="${highlightWidth}" height="${ideogramHeight + 12}" rx="12" fill="rgba(113,103,199,0.16)" stroke="${SELECTED_ACCENT}" stroke-width="1.4" pointer-events="none" />`);
-    svgParts.push(`<path d="M ${highlightStart + 8} ${ideogramY + ideogramHeight + 8} C ${highlightStart + 18} 136, ${trackX + 24} 142, ${trackX + 24} ${trackY}" fill="none" stroke="rgba(24,34,45,0.35)" stroke-width="1.4" pointer-events="none" />`);
-    svgParts.push(`<path d="M ${highlightStart + highlightWidth - 8} ${ideogramY + ideogramHeight + 8} C ${highlightStart + highlightWidth - 18} 136, ${trackX + trackWidth - 24} 142, ${trackX + trackWidth - 24} ${trackY}" fill="none" stroke="rgba(24,34,45,0.35)" stroke-width="1.4" pointer-events="none" />`);
+    svgParts.push(`<rect x="${highlightStart}" y="${ideogramY - 6}" width="${highlightWidth}" height="${ideogramHeight + 12}" rx="12" fill="rgba(113,103,199,0.16)" stroke="${SELECTED_ACCENT}" stroke-width="1.4" />`);
+    svgParts.push(`<path d="M ${highlightStart + 8} ${ideogramY + ideogramHeight + 8} C ${highlightStart + 18} 136, ${trackX + 24} 142, ${trackX + 24} ${trackY}" fill="none" stroke="rgba(24,34,45,0.35)" stroke-width="1.4" />`);
+    svgParts.push(`<path d="M ${highlightStart + highlightWidth - 8} ${ideogramY + ideogramHeight + 8} C ${highlightStart + highlightWidth - 18} 136, ${trackX + trackWidth - 24} 142, ${trackX + trackWidth - 24} ${trackY}" fill="none" stroke="rgba(24,34,45,0.35)" stroke-width="1.4" />`);
   }
+
+  svgParts.push(`<rect x="${ideogramX}" y="${ideogramY}" width="${ideogramWidth}" height="${ideogramHeight}" rx="15" fill="transparent" data-ideogram-click="true" style="cursor:pointer" />`);
 
   svgParts.push(`<text x="${ideogramX}" y="${ideogramY + 56}" fill="#5b6672" font-size="12" font-family="IBM Plex Sans">0 Mb</text>`);
   svgParts.push(`<text x="${ideogramX + ideogramWidth}" y="${ideogramY + 56}" text-anchor="end" fill="#5b6672" font-size="12" font-family="IBM Plex Sans">${formatMb(length)}</text>`);
   svgParts.push(`<rect x="${trackX}" y="${trackY}" width="${trackWidth}" height="${trackHeight}" rx="18" fill="rgba(255,255,255,0.72)" stroke="rgba(24,34,45,0.16)" stroke-width="1.2" />`);
-  svgParts.push(`<text x="${trackX}" y="${trackY - 14}" fill="#bf5f2f" font-size="12" font-family="IBM Plex Sans" font-weight="700">ANALYSIS WINDOW TRACK</text>`);
+  svgParts.push(`<text x="${trackX}" y="${trackY - 14}" fill="#bf5f2f" font-size="12" font-family="IBM Plex Sans" font-weight="700">CANDIDATE ORF TRACK</text>`);
+  orfLegendItems.forEach((legendItem, index) => {
+    const legendX = trackX + 172 + (index * 128);
+    svgParts.push(`<rect x="${legendX}" y="${orfLegendY}" width="12" height="12" rx="3" fill="${legendItem.color}" opacity="0.9" />`);
+    svgParts.push(`<text x="${legendX + 18}" y="${orfLegendY + 10}" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">${legendItem.label}</text>`);
+  });
+  svgParts.push(`<line x1="${trackX}" y1="${orfAxisBaselineY}" x2="${trackX + trackWidth}" y2="${orfAxisBaselineY}" stroke="rgba(24,34,45,0.26)" stroke-width="1" />`);
 
   if (!regions.length) {
     svgParts.push(`<text x="${trackX + 24}" y="${trackY + 58}" fill="#5b6672" font-size="14" font-family="IBM Plex Sans">Run or finish full analysis to populate region windows for this chromosome.</text>`);
@@ -569,13 +955,13 @@ function renderSelectedChromosomeVisual() {
       const motifHits = Number(region.motif_hits || 0);
       const orfCount = Number(region.orf_count || 0);
       const repeatBases = Number(region.repeat_bases || 0);
-      const regionX = trackX + (start / Math.max(length, 1)) * trackWidth;
-      const regionWidth = Math.max(6, ((end - start) / Math.max(length, 1)) * trackWidth);
-      const columnHeight = 18 + (gc * 1.1);
+      const regionX = trackX + (((start - trackStart) / trackSpan) * trackWidth);
+      const regionWidth = Math.max(lensDetailZoom ? 10 : 14, ((end - start) / trackSpan) * trackWidth);
+      const columnHeight = densityScale(orfCount, maxOrfCount, 18, 74);
       const regionY = trackY + trackHeight - columnHeight - 14;
       const labelY = trackY + trackHeight - 4;
 
-      svgParts.push(`<rect x="${regionX}" y="${regionY}" width="${regionWidth}" height="${columnHeight}" rx="8" fill="${gcColor(gc)}" opacity="0.88" class="region-window" style="cursor:pointer" data-wstart="${start}" data-wend="${end}" data-orf="${orfCount}" data-motif="${motifHits}" data-gc="${gc.toFixed(2)}" />`);
+      svgParts.push(`<rect x="${regionX}" y="${regionY}" width="${regionWidth}" height="${columnHeight}" rx="8" fill="${gcColor(gc)}" opacity="0.88" data-focus-start="${start}" data-focus-end="${end}" style="cursor:pointer" />`);
 
       if (motifHits > 0) {
         svgParts.push(`<circle cx="${regionX + regionWidth / 2}" cy="${regionY - 8}" r="${Math.min(6, 2 + motifHits / 2)}" fill="#bf5f2f" opacity="0.78" />`);
@@ -588,55 +974,104 @@ function renderSelectedChromosomeVisual() {
         svgParts.push(`<line x1="${flagX}" y1="${flagY - 2}" x2="${flagX}" y2="${regionY}" stroke="${SELECTED_ACCENT}" stroke-width="1.2" />`);
       }
 
-      if (index < 5) {
-        svgParts.push(`<text x="${regionX + regionWidth / 2}" y="${labelY}" text-anchor="middle" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">${(start / 1000000).toFixed(1)}</text>`);
-      }
-
       if (repeatBases > 0) {
         const repeatWidth = Math.min(regionWidth, Math.max(5, repeatBases / 900));
         svgParts.push(`<rect x="${regionX}" y="${trackY + 10}" width="${repeatWidth}" height="8" rx="4" fill="rgba(24,34,45,0.18)" />`);
       }
     });
 
+    trackTickValues.forEach((tickValue) => {
+      const tickX = trackX + (((tickValue - trackStart) / trackSpan) * trackWidth);
+      svgParts.push(`<line x1="${tickX}" y1="${orfAxisBaselineY}" x2="${tickX}" y2="${orfAxisBaselineY - 7}" stroke="rgba(24,34,45,0.3)" stroke-width="1" />`);
+      svgParts.push(`<text x="${tickX}" y="${orfAxisBaselineY + 14}" text-anchor="middle" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">${lensAxisLabel(tickValue, lensDetailZoom)}</text>`);
+    });
+    svgParts.push(`<text x="${trackX + trackWidth / 2}" y="${orfAxisBaselineY + 30}" text-anchor="middle" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">Genomic position</text>`);
+
+    svgParts.push(`<rect x="${trackX}" y="${motifTrackY}" width="${trackWidth}" height="${motifTrackHeight}" rx="16" fill="rgba(219,245,246,0.58)" stroke="rgba(10,136,142,0.22)" stroke-width="1.2" />`);
+    svgParts.push(`<text x="${trackX}" y="${motifTrackY - 10}" fill="#0a888e" font-size="12" font-family="IBM Plex Sans" font-weight="700">CpG MOTIFS (DENSITY)</text>`);
+    svgParts.push(`<line x1="${trackX + 20}" y1="${motifAxisTopY}" x2="${trackX + 20}" y2="${motifAxisBottomY}" stroke="rgba(10,136,142,0.32)" stroke-width="1" />`);
+    svgParts.push(`<line x1="${trackX + 20}" y1="${motifAxisBottomY}" x2="${trackX + trackWidth - 12}" y2="${motifAxisBottomY}" stroke="rgba(10,136,142,0.32)" stroke-width="1" />`);
+    svgParts.push(`<text x="${trackX + 10}" y="${motifAxisTopY + 4}" text-anchor="end" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">${maxMotifHits.toLocaleString()}</text>`);
+    svgParts.push(`<text x="${trackX + 10}" y="${motifAxisBottomY + 4}" text-anchor="end" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">0</text>`);
+    svgParts.push(`<text x="${trackX - 22}" y="${motifTrackY + motifTrackHeight / 2}" text-anchor="middle" fill="#5b6672" font-size="10" font-family="IBM Plex Sans" transform="rotate(-90 ${trackX - 22} ${motifTrackY + motifTrackHeight / 2})">Motif hits / window</text>`);
+
+    regions.forEach((region) => {
+      const start = Number(region.window_start || 0);
+      const end = Number(region.window_end || 0);
+      const motifHits = Number(region.motif_hits || 0);
+      const regionX = trackX + 20 + (((start - trackStart) / trackSpan) * (trackWidth - 32));
+      const regionWidth = Math.max(10, ((end - start) / trackSpan) * trackWidth);
+      const barHeight = densityScale(motifHits, maxMotifHits, 8, motifTrackHeight - 24);
+      const barY = motifAxisBottomY - barHeight;
+      svgParts.push(`<rect x="${regionX}" y="${barY}" width="${Math.max(4, regionWidth * 0.45)}" height="${barHeight}" rx="3" fill="#16a3a8" opacity="0.9" />`);
+    });
+    trackTickValues.forEach((tickValue) => {
+      const tickX = trackX + 20 + (((tickValue - trackStart) / trackSpan) * (trackWidth - 32));
+      svgParts.push(`<line x1="${tickX}" y1="${motifAxisBottomY}" x2="${tickX}" y2="${motifAxisBottomY + 5}" stroke="rgba(10,136,142,0.28)" stroke-width="1" />`);
+      svgParts.push(`<text x="${tickX}" y="${motifAxisBottomY + 18}" text-anchor="middle" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">${lensAxisLabel(tickValue, lensDetailZoom)}</text>`);
+    });
+    svgParts.push(`<text x="${trackX + trackWidth / 2}" y="${motifAxisBottomY + 34}" text-anchor="middle" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">Genomic position</text>`);
+
     const topPatternBadges = patterns.map((pattern, index) => {
       const x = trackX + (index * 182);
       const label = `${pattern.pattern_name} · ${pattern.hit_count}`;
       return [
-        `<rect x="${x}" y="326" width="170" height="28" rx="14" fill="rgba(255,255,255,0.84)" stroke="rgba(24,34,45,0.12)" />`,
-        `<text x="${x + 12}" y="344" fill="#18222d" font-size="12" font-family="IBM Plex Sans">${escapeHtml(label)}</text>`,
+        `<rect x="${x}" y="${badgeY}" width="170" height="28" rx="14" fill="rgba(255,255,255,0.84)" stroke="rgba(24,34,45,0.12)" />`,
+        `<text x="${x + 12}" y="${badgeTextY}" fill="#18222d" font-size="12" font-family="IBM Plex Sans">${escapeHtml(label)}</text>`,
       ].join("");
     });
     svgParts.push(...topPatternBadges);
   }
 
-  // CpG motif density track (full-chromosome coordinates)
-  const cpgY = 378;
-  const cpgH = 52;
-  const cpgMax = Math.max(1, ...activeRegionItems.map((r) => Number(r.motif_hits || 0)));
-  svgParts.push(`<text x="${trackX}" y="${cpgY - 8}" fill="#0d9488" font-size="12" font-family="IBM Plex Sans" font-weight="700">CpG MOTIFS (DENSITY)</text>`);
-  svgParts.push(`<rect x="${trackX}" y="${cpgY}" width="${trackWidth}" height="${cpgH}" rx="12" fill="rgba(240,253,252,0.88)" stroke="rgba(13,148,136,0.3)" stroke-width="1.2" />`);
-  if (activeRegionItems.length && length > 0) {
-    activeRegionItems.forEach((region) => {
-      const rStart = Number(region.window_start || 0);
-      const rEnd = Number(region.window_end || 0);
-      const motif = Number(region.motif_hits || 0);
-      if (motif === 0) return;
-      const rx = trackX + (rStart / length) * trackWidth;
-      const rw = Math.max(2, ((rEnd - rStart) / length) * trackWidth);
-      const intensity = motif / cpgMax;
-      const barH = Math.round(6 + intensity * (cpgH - 10));
-      svgParts.push(`<rect x="${rx.toFixed(1)}" y="${cpgY + cpgH - barH}" width="${rw.toFixed(1)}" height="${barH}" rx="3" fill="rgba(13,148,136,${(0.25 + intensity * 0.75).toFixed(2)})" class="cpg-band" style="cursor:pointer" data-wstart="${rStart}" data-wend="${rEnd}" data-motif="${motif}" />`);
-    });
-  } else {
-    svgParts.push(`<text x="${trackX + 24}" y="${cpgY + 32}" fill="#5b6672" font-size="13" font-family="IBM Plex Sans">CpG density will populate after full analysis.</text>`);
-  }
-  svgParts.push(`<text x="${trackX}" y="${cpgY + cpgH + 14}" fill="#5b6672" font-size="11" font-family="IBM Plex Sans">0</text>`);
-  svgParts.push(`<text x="${trackX + trackWidth}" y="${cpgY + cpgH + 14}" text-anchor="end" fill="#5b6672" font-size="11" font-family="IBM Plex Sans">${formatMb(length)}</text>`);
-
   svgParts.push("</svg>");
-  isZoomedIn = false; // overview is now showing
   selectedChromosomeVisual.innerHTML = svgParts.join("");
-  attachGenomeTrackEvents(activeChromosome);
+
+  const ideogramClick = selectedChromosomeVisual.querySelector("[data-ideogram-click='true']");
+  if (ideogramClick) {
+    ideogramClick.addEventListener("click", (event) => {
+      const rect = ideogramClick.getBoundingClientRect();
+      const ratio = rect.width ? (event.clientX - rect.left) / rect.width : 0;
+      const center = Math.max(0, Math.min(1, ratio)) * Math.max(length, 1);
+      const span = Math.max(12000000, Math.round(Math.max(length, 1) * 0.18));
+      lensFocusRange = {
+        start: Math.max(0, center - (span / 2)),
+        end: Math.min(Math.max(length, 1), center + (span / 2)),
+      };
+      lensDetailZoom = false;
+      renderSelectedChromosomeVisual();
+    });
+  }
+
+  selectedChromosomeVisual.querySelectorAll("[data-focus-start]").forEach((node) => {
+    node.addEventListener("click", () => {
+      const start = Number(node.getAttribute("data-focus-start") || 0);
+      const end = Number(node.getAttribute("data-focus-end") || 0);
+      const padding = Math.max(1500000, (end - start) * 2);
+      lensFocusRange = {
+        start: Math.max(0, start - padding),
+        end: Math.min(Math.max(length, 1), end + padding),
+      };
+      lensDetailZoom = false;
+      renderSelectedChromosomeVisual();
+    });
+  });
+
+  const resetFocus = selectedChromosomeVisual.querySelector("[data-reset-focus='true']");
+  if (resetFocus) {
+    resetFocus.addEventListener("click", () => {
+      lensFocusRange = null;
+      lensDetailZoom = false;
+      renderSelectedChromosomeVisual();
+    });
+  }
+
+  const zoomToggle = selectedChromosomeVisual.querySelector("[data-zoom-toggle='true']");
+  if (zoomToggle) {
+    zoomToggle.addEventListener("click", () => {
+      lensDetailZoom = !lensDetailZoom;
+      renderSelectedChromosomeVisual();
+    });
+  }
 
   if (!regions.length) {
     selectedChromosomeVisualNote.textContent = `Chromosome ${activeChromosome} does not have region-level outputs yet, so the lower lens is waiting on full analysis.`;
@@ -645,7 +1080,9 @@ function renderSelectedChromosomeVisual() {
 
   const firstRegion = regions[0];
   const lastRegion = regions[regions.length - 1];
-  selectedChromosomeVisualNote.textContent = `The lower lens samples ${regions.length.toLocaleString()} region windows across ${formatWindowRange(Number(firstRegion.window_start || 0), Number(lastRegion.window_end || 0))} for chromosome ${activeChromosome}. Click the ideogram or CpG density track to zoom into a local segment.`;
+  selectedChromosomeVisualNote.textContent = lensDetailZoom
+    ? `Zoomed view covers ${formatWindowRange(Number(firstRegion.window_start || 0), Number(lastRegion.window_end || 0))}. Click ZOOMED VIEW to toggle back, or Reset lens to return to the full chromosome.`
+    : `The lower lens covers ${formatWindowRange(Number(firstRegion.window_start || 0), Number(lastRegion.window_end || 0))} with GC-colored ORF bars, motif markers, and CpG density for chromosome ${activeChromosome}. Click the ideogram or ORF bars to refocus the lens, then click ZOOMED VIEW for a local-range detail view.`;
 }
 
 function applyChromosomeInventory(items) {
@@ -661,6 +1098,8 @@ function applyChromosomeInventory(items) {
         latestKey: item.latest_key,
         sequenceLength: item.sequence_length,
         avgGcContent: item.avg_gc_content,
+        patternHitCount: item.pattern_hit_count,
+        orfCount: item.orf_count,
         fullAnalysisEligible: item.full_analysis_eligible,
         fullAnalysisStatus: item.full_analysis_status,
         fullAnalysisReason: item.full_analysis_reason,
@@ -685,16 +1124,51 @@ function renderSummaryCards() {
   summaryCards.innerHTML = "";
 
   chromosomeSummaries.forEach((item) => {
+    const live = chromosomeState(item.chromosome);
+    const trackedProcessing = hasTrackedProcessing(live) && !live.patternsReady && !live.regionsReady;
+    const batchActive = hasBatchProgress(live) && !live.patternsReady && !live.regionsReady;
+    const athenaPending = isAthenaSyncPending(live);
+    const patternAthenaDetail = athenaPending
+      ? formatAthenaSyncDetail(live, "Pattern analysis")
+      : null;
+    const regionAthenaDetail = athenaPending
+      ? formatAthenaSyncDetail(live, "Region analysis")
+      : null;
+    const patternBatchDetail = batchActive
+      ? formatBatchProgressDetail(live, "Pattern analysis")
+      : null;
+    const regionBatchDetail = batchActive
+      ? formatBatchProgressDetail(live, "Region analysis")
+      : null;
+    const patternTrackedDetail = trackedProcessing
+      ? formatTrackedProgressDetail(live, "Pattern analysis")
+      : null;
+    const regionTrackedDetail = trackedProcessing
+      ? formatTrackedProgressDetail(live, "Region analysis")
+      : null;
     const card = document.createElement("article");
     card.className = "summary-card";
     card.innerHTML = `
       <span class="metric-label">Chromosome ${item.chromosome}</span>
       <strong>${item.length}</strong>
       <p>GC content: ${item.gc}</p>
-      <p>Patterns: ${item.patterns}</p>
-      <p>ORF status: ${item.orfs}</p>
+      <p>Patterns: ${athenaPending ? "Loading from Athena..." : trackedProcessing ? "Loading from operations store..." : batchActive ? "Loading from AWS Batch..." : item.patterns}</p>
+      ${athenaPending ? `<p class="summary-subdetail">${escapeHtml(patternAthenaDetail || "")}</p>` : ""}
+      ${!athenaPending && patternTrackedDetail ? `<p class="summary-subdetail">${escapeHtml(patternTrackedDetail)}</p>` : ""}
+      ${!athenaPending && patternBatchDetail ? `<p class="summary-subdetail">${escapeHtml(patternBatchDetail)}</p>` : ""}
+      <p>ORF status: ${athenaPending ? "Loading from Athena..." : trackedProcessing ? "Loading from operations store..." : batchActive ? "Loading from AWS Batch..." : item.orfs}</p>
+      ${athenaPending ? `<p class="summary-subdetail">${escapeHtml(regionAthenaDetail || "")}</p>` : ""}
+      ${!athenaPending && regionTrackedDetail ? `<p class="summary-subdetail">${escapeHtml(regionTrackedDetail)}</p>` : ""}
+      ${!athenaPending && regionBatchDetail ? `<p class="summary-subdetail">${escapeHtml(regionBatchDetail)}</p>` : ""}
     `;
     summaryCards.appendChild(card);
+  });
+}
+
+function syncTableScrollIndicators() {
+  document.querySelectorAll(".table-scroll-frame").forEach((frame) => {
+    frame.querySelectorAll(".table-scroll-indicator").forEach((indicator) => indicator.remove());
+    delete frame.dataset.scrollIndicatorBound;
   });
 }
 
@@ -717,6 +1191,8 @@ function renderPatternTable() {
     `;
     patternTable.appendChild(tr);
   });
+
+  syncTableScrollIndicators();
 }
 
 function renderOrfTable() {
@@ -738,130 +1214,149 @@ function renderOrfTable() {
     `;
     orfTable.appendChild(tr);
   });
+
+  syncTableScrollIndicators();
 }
 
 function renderGcBars() {
   gcBars.innerHTML = "";
 
-  if (!gcValues.length) {
+  if (!activeRegionItems.length) {
     const note = document.createElement("p");
     note.className = "table-empty";
-    note.textContent = `No GC windows available for chromosome ${activeChromosome} yet.`;
+    note.textContent = `No region windows available for chromosome ${activeChromosome} yet.`;
     gcBars.appendChild(note);
+    if (regionChartNote) {
+      regionChartNote.textContent = "GC% and ORF-count chart will appear after region-level outputs load.";
+    }
     return;
   }
 
-  gcValues.forEach((value, index) => {
-    const bar = document.createElement("div");
-    bar.className = "bar";
-    bar.style.height = `${Math.max(18, value * 2.2)}px`;
-    bar.title = `${activeChromosome} window ${index + 1}: ${value}% GC`;
-    gcBars.appendChild(bar);
+  const regions = buildLensRegionSample(activeRegionItems, 18);
+  const width = 720;
+  const height = 250;
+  const margin = { top: 18, right: 56, bottom: 54, left: 56 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const maxGc = Math.max(50, ...regions.map((item) => Number(item.gc_content || 0)));
+  const gcAxisMax = Math.ceil((maxGc + 5) / 5) * 5;
+  const maxOrf = Math.max(1, ...regions.map((item) => Number(item.orf_count || 0)));
+  const xStep = regions.length > 1 ? plotWidth / (regions.length - 1) : plotWidth;
+  const tickCount = 4;
+  const svgParts = [
+    `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Region chart showing GC percentage and ORF counts by genomic window">`,
+    `<rect x="0" y="0" width="${width}" height="${height}" rx="14" fill="rgba(255,255,255,0.42)" />`,
+    `<text x="${margin.left}" y="14" fill="#18222d" font-size="12" font-family="IBM Plex Sans" font-weight="700">GC% line + ORF-count bars</text>`,
+  ];
+
+  for (let tick = 0; tick <= tickCount; tick += 1) {
+    const ratio = tick / tickCount;
+    const y = margin.top + plotHeight - (ratio * plotHeight);
+    const gcLabel = Math.round(ratio * gcAxisMax);
+    const orfLabel = Math.round(ratio * maxOrf);
+    svgParts.push(`<line x1="${margin.left}" y1="${y}" x2="${width - margin.right}" y2="${y}" stroke="rgba(24,34,45,0.08)" stroke-width="1" />`);
+    svgParts.push(`<text x="${margin.left - 10}" y="${y + 4}" text-anchor="end" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">${gcLabel}</text>`);
+    svgParts.push(`<text x="${width - margin.right + 10}" y="${y + 4}" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">${orfLabel}</text>`);
+  }
+
+  const linePoints = [];
+  regions.forEach((region, index) => {
+    const start = Number(region.window_start || 0);
+    const end = Number(region.window_end || 0);
+    const gc = Number(region.gc_content || 0);
+    const orf = Number(region.orf_count || 0);
+    const x = margin.left + (index * xStep);
+    const barHeight = (orf / maxOrf) * plotHeight;
+    const barY = margin.top + plotHeight - barHeight;
+    const gcY = margin.top + plotHeight - ((gc / gcAxisMax) * plotHeight);
+    const barWidth = Math.max(10, Math.min(22, xStep * 0.48 || 18));
+    linePoints.push(`${x},${gcY}`);
+    svgParts.push(
+      `<rect x="${x - (barWidth / 2)}" y="${barY}" width="${barWidth}" height="${Math.max(2, barHeight)}" rx="5" fill="rgba(191,95,47,0.52)"><title>${activeChromosome}: ${formatCompactCoord(start)}-${formatCompactCoord(end)} | ORFs ${orf.toLocaleString()} | GC ${gc.toFixed(2)}%</title></rect>`,
+    );
   });
-}
 
-function showSummaryLoadingState(chromosome, message = "Loading…") {
-  const item = chromosomeState(chromosome);
-  chromosomeSummaries.length = 0;
-  chromosomeSummaries.push({
-    chromosome,
-    length: item.sequenceLength ? `${Number(item.sequenceLength).toLocaleString()} bp` : "Loading…",
-    gc: item.avgGcContent ? `${item.avgGcContent}%` : message,
-    patterns: message,
-    orfs: message,
+  svgParts.push(`<polyline fill="none" stroke="#0b6e4f" stroke-width="3" points="${linePoints.join(" ")}" />`);
+
+  regions.forEach((region, index) => {
+    const start = Number(region.window_start || 0);
+    const end = Number(region.window_end || 0);
+    const gc = Number(region.gc_content || 0);
+    const x = margin.left + (index * xStep);
+    const gcY = margin.top + plotHeight - ((gc / gcAxisMax) * plotHeight);
+    svgParts.push(
+      `<circle cx="${x}" cy="${gcY}" r="4" fill="#0b6e4f" stroke="#f8fff9" stroke-width="1.5"><title>${activeChromosome}: ${formatCompactCoord(start)}-${formatCompactCoord(end)} | GC ${gc.toFixed(2)}%</title></circle>`,
+    );
   });
-  renderSummaryCards();
-}
 
-function showAthenaLoadingLabel(percent, phase = "Loading from Athena") {
-  const pct = Math.max(1, Math.min(99, Math.round(Number(percent) || 0)));
-  return `${phase}… ${pct}%`;
-}
-
-function showAthenaLoadingState(
-  chromosome,
-  item = chromosomeState(chromosome),
-  percent = 92,
-  phase = "Loading from Athena",
-) {
-  const loadingLabel = showAthenaLoadingLabel(percent, phase);
-  chromosomeSummaries.length = 0;
-  chromosomeSummaries.push({
-    chromosome,
-    length: item && item.sequenceLength ? `${Number(item.sequenceLength).toLocaleString()} bp` : "n/a",
-    gc: item && item.avgGcContent ? `${item.avgGcContent}%` : "n/a",
-    patterns: loadingLabel,
-    orfs: loadingLabel,
+  const labelIndexes = new Set([0, Math.round((regions.length - 1) * 0.33), Math.round((regions.length - 1) * 0.66), Math.max(0, regions.length - 1)]);
+  regions.forEach((region, index) => {
+    if (!labelIndexes.has(index)) {
+      return;
+    }
+    const start = Number(region.window_start || 0);
+    const x = margin.left + (index * xStep);
+    svgParts.push(`<text x="${x}" y="${height - 18}" text-anchor="middle" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">${formatCompactCoord(start)}</text>`);
   });
-  renderSummaryCards();
 
-  if (selectedChromosomeVisualNote && chromosome === activeChromosome) {
-    selectedChromosomeVisualNote.textContent =
-      `${loadingLabel} for chromosome ${chromosome} — pattern and region windows will appear shortly.`;
+  svgParts.push(`<line x1="${margin.left}" y1="${margin.top + plotHeight}" x2="${width - margin.right}" y2="${margin.top + plotHeight}" stroke="rgba(24,34,45,0.22)" stroke-width="1.2" />`);
+  svgParts.push(`<text x="${width / 2}" y="${height - 4}" text-anchor="middle" fill="#5b6672" font-size="11" font-family="IBM Plex Sans">Genomic window start</text>`);
+  svgParts.push(`<text x="16" y="${margin.top + (plotHeight / 2)}" text-anchor="middle" fill="#0b6e4f" font-size="11" font-family="IBM Plex Sans" transform="rotate(-90 16 ${margin.top + (plotHeight / 2)})">GC %</text>`);
+  svgParts.push(`<text x="${width - 10}" y="${margin.top + (plotHeight / 2)}" text-anchor="middle" fill="#bf5f2f" font-size="11" font-family="IBM Plex Sans" transform="rotate(90 ${width - 10} ${margin.top + (plotHeight / 2)})">ORF count</text>`);
+  svgParts.push(`<rect x="${width - 180}" y="10" width="10" height="10" rx="3" fill="rgba(191,95,47,0.52)" />`);
+  svgParts.push(`<text x="${width - 165}" y="19" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">ORF count</text>`);
+  svgParts.push(`<line x1="${width - 96}" y1="15" x2="${width - 78}" y2="15" stroke="#0b6e4f" stroke-width="3" />`);
+  svgParts.push(`<circle cx="${width - 87}" cy="15" r="3.5" fill="#0b6e4f" stroke="#f8fff9" stroke-width="1.2" />`);
+  svgParts.push(`<text x="${width - 72}" y="19" fill="#5b6672" font-size="10" font-family="IBM Plex Sans">GC %</text>`);
+  svgParts.push(`</svg>`);
+
+  gcBars.innerHTML = svgParts.join("");
+  if (regionChartNote) {
+    regionChartNote.textContent = `Sampled ${regions.length} informative region windows for chromosome ${activeChromosome}; ORF count is shown as bars and GC% as a line.`;
   }
 }
 
 function applySummary(summary) {
+  const live = chromosomeState(summary.chromosome);
+  const patternSummary = summary.patterns_ready
+    ? (Number(summary.pattern_hit_count || 0) > 0 ? `${summary.pattern_hit_count} hits` : "0 hits")
+    : "No completed pattern dataset yet";
+  const regionSummary = summary.regions_ready
+    ? (Number(summary.orf_count || 0) > 0 ? `${summary.orf_count} window ORFs` : "0 window ORFs")
+    : "No completed region dataset yet";
+  chromosomeDetailsLoading = false;
   activeSummary = summary;
-  // Always update the inventory (drives status cards and eligibility)
   chromosomeInventory.set(summary.chromosome, {
-    ...chromosomeState(summary.chromosome),
+    ...live,
+    ready: typeof summary.sequence_ready === "boolean" ? summary.sequence_ready : live.ready,
+    patternsReady: typeof summary.patterns_ready === "boolean" ? summary.patterns_ready : live.patternsReady,
+    regionsReady: typeof summary.regions_ready === "boolean" ? summary.regions_ready : live.regionsReady,
+    latestOutputAt: summary.latest_output_at || live.latestOutputAt,
     sequenceLength: summary.sequence_length,
     avgGcContent: summary.avg_gc_content,
+    patternHitCount: summary.pattern_hit_count,
+    orfCount: summary.orf_count,
     fullAnalysisEligible: summary.full_analysis_eligible,
     fullAnalysisStatus: summary.full_analysis_status,
     fullAnalysisReason: summary.full_analysis_reason,
     fullAnalysisMaxBases: summary.full_analysis_max_bases,
+    processingStatus: summary.processing_status || live.processingStatus,
+    batchStatus: summary.batch_status || live.batchStatus,
   });
-
-  // Skip the summary card if patterns are marked ready but count is 0 —
-  // this means Athena MSCK propagation hasn't finished yet. Keep showing
-  // the previous card data instead of overwriting with stale zeros.
-  const hasRealData = summary.pattern_hit_count && summary.pattern_hit_count !== "0";
-  const patternsKnownReady = summary.patterns_ready && summary.regions_ready;
-  if (patternsKnownReady && !hasRealData) {
-    // Athena hasn't propagated yet — clear stale data and auto-trigger /sync
-    activePatternItems = [];
-    patternRows.length = 0;
-
-    showAthenaLoadingState(summary.chromosome, {
-      ...chromosomeState(summary.chromosome),
-      sequenceLength: summary.sequence_length,
-      avgGcContent: summary.avg_gc_content,
-    }, 96);
-    renderPatternTable();
-    if (!isZoomedIn) {
-      renderSelectedChromosomeVisual();
-    }
-
-    // Auto-trigger /sync so Glue partition + cache are fixed automatically
-    // (handles cases where the batch poll skipped sync because patternsReady=True)
-    const chr = summary.chromosome;
-    if (API_BASE_URL && !window._autoSyncing) {
-      window._autoSyncing = chr;
-      fetch(`${API_BASE_URL}/api/chromosomes/${chr}/sync`, { method: "POST" })
-        .then(() => {
-          window._autoSyncing = null;
-          setTimeout(() => hydrateDashboard(), 5000);
-        })
-        .catch(e => { window._autoSyncing = null; console.warn("auto-sync failed", e); });
-    }
-    return;
-  }
-
   chromosomeSummaries.length = 0;
   chromosomeSummaries.push({
     chromosome: summary.chromosome,
     length: summary.sequence_length ? `${Number(summary.sequence_length).toLocaleString()} bp` : "n/a",
     gc: summary.avg_gc_content ? `${summary.avg_gc_content}%` : "n/a",
-    patterns: summary.pattern_hit_count ? `${summary.pattern_hit_count} hits` : "n/a",
-    orfs: summary.orf_count ? `${summary.orf_count} window ORFs` : "n/a",
+    patterns: patternSummary,
+    orfs: regionSummary,
   });
   renderSummaryCards();
-  if (!isZoomedIn) renderSelectedChromosomeVisual();
+  renderSelectedChromosomeVisual();
 }
 
 function applyPatterns(items) {
+  chromosomeDetailsLoading = false;
   activePatternItems = items.slice();
   patternRows.length = 0;
   items.forEach((item) => {
@@ -872,15 +1367,16 @@ function applyPatterns(items) {
     });
   });
   renderPatternTable();
-  if (!isZoomedIn) renderSelectedChromosomeVisual();
+  renderSelectedChromosomeVisual();
 }
 
 function applyRegions(items) {
+  chromosomeDetailsLoading = false;
   activeRegionItems = items.slice();
   orfRows.length = 0;
   gcValues.length = 0;
 
-  items.forEach((item) => {
+  buildLensRegionSample(items, 24).forEach((item) => {
     orfRows.push({
       window: `${activeChromosome}:${item.window_start}-${item.window_end}`,
       gc: item.gc_content,
@@ -891,12 +1387,47 @@ function applyRegions(items) {
 
   renderOrfTable();
   renderGcBars();
-  if (!isZoomedIn) renderSelectedChromosomeVisual();
+  renderSelectedChromosomeVisual();
+}
+
+function applyBatchStatus(chromosome, batchStatus) {
+  const live = chromosomeState(chromosome);
+  chromosomeInventory.set(chromosome, {
+    ...live,
+    batchStatus: batchStatus || null,
+  });
+}
+
+function applyOperations(chromosome, operations) {
+  if (!operations || (!operations.item && !operations.processing_status)) {
+    return;
+  }
+
+  const live = chromosomeState(chromosome);
+  const current = operations.item || {};
+  const sequenceReady = typeof current.sequence_ready === "boolean"
+    ? current.sequence_ready
+    : live.ready;
+  const patternsReady = typeof current.patterns_ready === "boolean"
+    ? current.patterns_ready
+    : live.patternsReady;
+  const regionsReady = typeof current.regions_ready === "boolean"
+    ? current.regions_ready
+    : live.regionsReady;
+  const latestOutputAt = current.updated_at || current.finished_at || current.submitted_at || live.latestOutputAt;
+
+  chromosomeInventory.set(chromosome, {
+    ...live,
+    ready: sequenceReady,
+    patternsReady,
+    regionsReady,
+    latestOutputAt,
+    processingStatus: operations.processing_status || live.processingStatus || null,
+  });
 }
 
 function showUnavailableChromosome(chromosome) {
-  // Never wipe the visualization while the user is in a zoomed view
-  if (isZoomedIn) return;
+  chromosomeDetailsLoading = false;
   activeSummary = null;
   activePatternItems = [];
   activeRegionItems = [];
@@ -920,302 +1451,27 @@ function showUnavailableChromosome(chromosome) {
   renderSelectedChromosomeVisual();
 }
 
-function applyOrfs(items) {
-  activeOrfItems = items.slice();
-}
-
-function applyCpgs(items) {
-  activeCpgItems = items.slice();
-}
-
-function getOrCreateTooltip() {
-  let tip = document.getElementById("genomeTooltip");
-  if (!tip) {
-    tip = document.createElement("div");
-    tip.id = "genomeTooltip";
-    tip.className = "genome-tooltip";
-    document.body.appendChild(tip);
-    // Hide tooltip on scroll or any click outside the lens
-    window.addEventListener("scroll", () => { tip.style.display = "none"; }, { passive: true });
-    document.addEventListener("click", () => { tip.style.display = "none"; }, { capture: true, passive: true });
+function stopBatchStatusPolling() {
+  if (batchStatusPollTimer) {
+    window.clearTimeout(batchStatusPollTimer);
+    batchStatusPollTimer = null;
   }
-  return tip;
 }
 
-function attachGenomeTrackEvents(chromosome) {
-  try {
-  const tip = getOrCreateTooltip();
-  const moveTip = (e) => { tip.style.left = `${e.clientX + 14}px`; tip.style.top = `${e.clientY - 8}px`; };
-  const hideTip = () => { tip.style.display = "none"; };
-
-  // Band hover tooltips
-  const chrLen = chromosomeLengthValue(chromosome) || 1;
-
-  // Build a sorted lookup of regions for coordinate → window mapping
-  const regionLookup = activeRegionItems
-    .filter(r => r.window_start != null)
-    .map(r => ({ ws: +r.window_start, we: +r.window_end, orf: +r.orf_count || 0, motif: +r.motif_hits || 0, gc: +r.gc_content || 0 }))
-    .sort((a, b) => a.ws - b.ws);
-
-  function attachRegionTarget(selector, tooltipHtml, zoomMultiplier = 1) {
-    selectedChromosomeVisual.querySelectorAll(selector).forEach((el) => {
-      el.style.cursor = "pointer";
-      el.addEventListener("mouseenter", (e) => {
-        tip.innerHTML = tooltipHtml(el);
-        tip.style.display = "block";
-        moveTip(e);
-      });
-      el.addEventListener("mousemove", moveTip);
-      el.addEventListener("mouseleave", hideTip);
-      el.addEventListener("click", (e) => {
-        e.stopPropagation();
-        hideTip();
-        const ws = +el.dataset.wstart;
-        const we = +el.dataset.wend;
-        const span = Math.max(1, we - ws);
-        zoomToGenomeRegion(
-          chromosome,
-          Math.max(0, ws - span * zoomMultiplier),
-          Math.min(chrLen, we + span * zoomMultiplier),
-        );
-      });
-    });
+function scheduleBatchStatusPolling(chromosome) {
+  stopBatchStatusPolling();
+  const item = chromosomeState(chromosome);
+  if (
+    chromosome !== activeChromosome
+    || (!hasTrackedProcessing(item) && !isBatchJobActive(item) && !isAthenaSyncPending(item))
+  ) {
+    return;
   }
-
-  attachRegionTarget(
-    ".orf-band[data-wstart]",
-    (el) => `<strong>${formatCoord(+el.dataset.wstart)} – ${formatCoord(+el.dataset.wend)}</strong><br>ORFs: <b>${el.dataset.orf}</b> &nbsp;·&nbsp; CpG hits: <b>${el.dataset.motif}</b> &nbsp;·&nbsp; GC: <b>${Number(el.dataset.gc || 0).toFixed(1)}%</b><br><small style="color:#7167c7">Click to zoom</small>`,
-    1,
-  );
-
-  attachRegionTarget(
-    ".region-window",
-    (el) => `<strong>${formatCoord(+el.dataset.wstart)} – ${formatCoord(+el.dataset.wend)}</strong><br>ORFs: <b>${el.dataset.orf}</b> &nbsp;·&nbsp; CpG hits: <b>${el.dataset.motif}</b> &nbsp;·&nbsp; GC: <b>${Number(el.dataset.gc || 0).toFixed(1)}%</b><br><small style="color:#bf5f2f">Click to zoom</small>`,
-    1,
-  );
-
-  attachRegionTarget(
-    ".cpg-band",
-    (el) => `<strong>${formatCoord(+el.dataset.wstart)} – ${formatCoord(+el.dataset.wend)}</strong><br>CpG hits: <b>${el.dataset.motif}</b><br><small style="color:#0d9488">Click to zoom</small>`,
-    1,
-  );
-
-  // Use the container div for reliable clicks — abort previous listeners first
-  if (selectedChromosomeVisual._lensAbort) selectedChromosomeVisual._lensAbort.abort();
-  const lensCtrl = new AbortController();
-  selectedChromosomeVisual._lensAbort = lensCtrl;
-  const sig = lensCtrl.signal;
-
-  if (!regionLookup.length) return;
-
-  const IX = 44, IW = 672, IY = 64, IH = 30;
-
-  // Always query the CURRENT svg at event time — a stale closure reference returns
-  // zero bounding rect if innerHTML was replaced, breaking inIdeogram/regionAtClientX
-  function currentSvg() { return selectedChromosomeVisual.querySelector("svg"); }
-
-  function regionAtClientX(clientX) {
-    const s = currentSvg(); if (!s) return regionLookup[0];
-    const r = s.getBoundingClientRect();
-    const scale = r.width / 760;
-    const frac = Math.max(0, Math.min(1, (clientX - r.left - IX * scale) / (IW * scale)));
-    const genomicPos = frac * chrLen;
-    let best = regionLookup[0];
-    let bestD = Infinity;
-    for (const reg of regionLookup) {
-      const mid = (reg.ws + reg.we) / 2;
-      const d = Math.abs(mid - genomicPos);
-      if (d < bestD) { bestD = d; best = reg; } else if (d > bestD) break;
+  batchStatusPollTimer = window.setTimeout(() => {
+    if (chromosome === activeChromosome) {
+      loadChromosomeDetails(chromosome, { preserveFocus: true });
     }
-    return best;
-  }
-
-  function inIdeogram(e) {
-    const s = currentSvg(); if (!s) return false;
-    const r = s.getBoundingClientRect();
-    if (!r.width) return false;
-    const scale = r.width / 760;
-    const svgX = (e.clientX - r.left) / scale;
-    const svgY = (e.clientY - r.top) / scale;
-    return svgX >= IX && svgX <= IX + IW && svgY >= IY - 12 && svgY <= IY + IH + 12;
-  }
-
-  selectedChromosomeVisual.addEventListener("mousemove", (e) => {
-    if (e.target && e.target.closest(".orf-band,.region-window,.cpg-band")) {
-      return;
-    }
-    if (!inIdeogram(e)) { hideTip(); return; }
-    const reg = regionAtClientX(e.clientX);
-    if (!reg) return;
-    selectedChromosomeVisual.style.cursor = "pointer";
-    tip.innerHTML = `<strong>${formatCoord(reg.ws)} – ${formatCoord(reg.we)}</strong><br>ORFs: <b>${reg.orf}</b> &nbsp;·&nbsp; CpG hits: <b>${reg.motif}</b> &nbsp;·&nbsp; GC: <b>${reg.gc.toFixed(1)}%</b><br><small style="color:#7167c7">Click to zoom into this region</small>`;
-    tip.style.display = "block";
-    moveTip(e);
-  }, { signal: sig });
-
-  selectedChromosomeVisual.addEventListener("mouseleave", () => {
-    hideTip();
-    selectedChromosomeVisual.style.cursor = "";
-  }, { signal: sig });
-
-  selectedChromosomeVisual.addEventListener("click", (e) => {
-    if (e.target && e.target.closest(".orf-band,.region-window,.cpg-band")) {
-      return;
-    }
-    if (!inIdeogram(e)) return;
-    hideTip();
-    const reg = regionAtClientX(e.clientX);
-    if (!reg) return;
-    const span = reg.we - reg.ws;
-    selectedChromosomeVisualNote.textContent = `Zooming into ${formatCoord(reg.ws)} – ${formatCoord(reg.we + span)}…`;
-    zoomToGenomeRegion(chromosome, Math.max(0, reg.ws - span), Math.min(chrLen, reg.we + span));
-  }, { signal: sig });
-  } catch (err) {
-    console.warn("attachGenomeTrackEvents failed:", err);
-  }
-}
-
-async function zoomToGenomeRegion(chromosome, regionStart, regionEnd) {
-  if (!API_BASE_URL) return;
-
-  // Cancel any previous in-flight background fetch for another region
-  if (zoomAbortController) zoomAbortController.abort();
-  zoomAbortController = new AbortController();
-  const signal = zoomAbortController.signal;
-
-  const tip = getOrCreateTooltip();
-  tip.style.display = "none";
-
-  // Render immediately — no wait for Athena
-  applyOrfs([]);
-  applyCpgs([]);
-  renderZoomedGenomeTrack(chromosome, regionStart, regionEnd);
-
-  // Background fetch: individual ORF + CpG positions
-  try {
-    const headers = {};
-    const [orfRes, cpgRes] = await Promise.all([
-      fetch(`${API_BASE_URL}/api/chromosomes/${chromosome}/orfs?start=${regionStart}&end=${regionEnd}`, { signal })
-        .then(r => r.ok ? r.json() : null).catch(() => null),
-      fetch(`${API_BASE_URL}/api/chromosomes/${chromosome}/cpg?start=${regionStart}&end=${regionEnd}`, { signal })
-        .then(r => r.ok ? r.json() : null).catch(() => null),
-    ]);
-
-    if (signal.aborted) return; // User zoomed out — discard results
-
-    const orfs = orfRes && Array.isArray(orfRes.items) ? orfRes.items : [];
-    const cpgs = cpgRes && Array.isArray(cpgRes.items) ? cpgRes.items : [];
-    if (orfs.length || cpgs.length) {
-      applyOrfs(orfs);
-      applyCpgs(cpgs);
-      renderZoomedGenomeTrack(chromosome, regionStart, regionEnd);
-    }
-  } catch (err) {
-    if (!signal.aborted) console.warn("ORF/CpG detail fetch failed:", err);
-  }
-}
-
-function renderZoomedGenomeTrack(chromosome, viewStart, viewEnd) {
-  const span = viewEnd - viewStart || 1;
-  const orfs = activeOrfItems;
-  const cpgs = activeCpgItems;
-  const lx = 44;
-  const tw = 672;
-  const orfH = 110;
-  const cpgH = 80;
-  const svgH = 456;
-
-  const svgParts = [
-    `<svg viewBox="0 0 760 ${svgH}" role="img" aria-label="Zoomed region">`,
-    `<rect x="0" y="0" width="760" height="${svgH}" rx="26" fill="rgba(255,255,255,0.5)" />`,
-    `<text x="${lx}" y="30" fill="#18222d" font-size="18" font-family="Space Grotesk" font-weight="700">Chr${escapeHtml(chromosome)}: ${formatCoord(viewStart)} – ${formatCoord(viewEnd)}</text>`,
-    `<text x="${lx}" y="48" fill="#5b6672" font-size="12" font-family="IBM Plex Sans">${orfs.length} candidate ORFs · ${cpgs.length} CpG sites · ${formatMb(span)} span</text>`,
-    `<rect x="${lx}" y="56" width="100" height="26" rx="13" fill="${SELECTED_ACCENT}" class="zoom-out-btn" style="cursor:pointer" />`,
-    `<text x="${lx + 50}" y="73" text-anchor="middle" fill="white" font-size="12" font-family="IBM Plex Sans" class="zoom-out-btn" style="cursor:pointer;pointer-events:none">← Zoom out</text>`,
-  ];
-
-  // ORF track
-  const orfY = 94;
-  svgParts.push(`<text x="${lx}" y="${orfY - 8}" fill="#7167c7" font-size="12" font-family="IBM Plex Sans" font-weight="700">CANDIDATE ORFs (${orfs.length})</text>`);
-  svgParts.push(`<rect x="${lx}" y="${orfY}" width="${tw}" height="${orfH}" rx="12" fill="rgba(248,244,238,0.9)" stroke="rgba(113,103,199,0.3)" stroke-width="1.2" />`);
-  svgParts.push(`<line x1="${lx}" y1="${orfY + orfH / 2}" x2="${lx + tw}" y2="${orfY + orfH / 2}" stroke="rgba(113,103,199,0.18)" stroke-width="1" stroke-dasharray="4,4" />`);
-  svgParts.push(`<text x="${lx + tw + 8}" y="${orfY + 24}" fill="#7167c7" font-size="11" font-family="IBM Plex Sans">+</text>`);
-  svgParts.push(`<text x="${lx + tw + 8}" y="${orfY + orfH - 8}" fill="#7167c7" font-size="11" font-family="IBM Plex Sans">−</text>`);
-
-  orfs.forEach((orf) => {
-    const s = Number(orf.pos_start || 0);
-    const e = Number(orf.pos_end || 0);
-    const x = lx + ((s - viewStart) / span) * tw;
-    const w = Math.max(2, ((e - s) / span) * tw);
-    const isPlus = (orf.strand || "+") !== "-";
-    const ry = isPlus ? orfY + 8 : orfY + orfH / 2 + 4;
-    const rh = orfH / 2 - 14;
-    svgParts.push(`<rect x="${x.toFixed(1)}" y="${ry}" width="${w.toFixed(1)}" height="${rh}" rx="3" fill="${SELECTED_ACCENT}" opacity="0.82" class="zoom-orf" data-start="${s}" data-end="${e}" data-strand="${escapeHtml(orf.strand || '+')}" data-len="${orf.hit_length || ''}" />`);
-  });
-
-  // CpG track
-  const cpgY = orfY + orfH + 24;
-  svgParts.push(`<text x="${lx}" y="${cpgY - 8}" fill="#0d9488" font-size="12" font-family="IBM Plex Sans" font-weight="700">CpG MOTIFS (${cpgs.length})</text>`);
-  svgParts.push(`<rect x="${lx}" y="${cpgY}" width="${tw}" height="${cpgH}" rx="12" fill="rgba(240,253,252,0.9)" stroke="rgba(13,148,136,0.3)" stroke-width="1.2" />`);
-  if (cpgs.length === 0) {
-    svgParts.push(`<text x="${lx + 20}" y="${cpgY + cpgH / 2 + 4}" fill="#5b6672" font-size="13" font-family="IBM Plex Sans">No CpG sites detected in this region — try dragging a wider selection</text>`);
-  }
-  cpgs.forEach((cpg) => {
-    const x = lx + ((Number(cpg.pos_start || 0) - viewStart) / span) * tw;
-    svgParts.push(`<rect x="${x.toFixed(1)}" y="${cpgY + 6}" width="4" height="${cpgH - 12}" rx="2" fill="rgba(13,148,136,0.72)" class="zoom-cpg" data-start="${cpg.pos_start}" />`);
-  });
-
-  // Coordinate axis
-  const axisY = cpgY + cpgH + 20;
-  svgParts.push(`<line x1="${lx}" y1="${axisY}" x2="${lx + tw}" y2="${axisY}" stroke="rgba(24,34,45,0.18)" stroke-width="1" />`);
-  for (let i = 0; i <= 4; i++) {
-    const pos = viewStart + (i / 4) * span;
-    const x = lx + (i / 4) * tw;
-    svgParts.push(`<line x1="${x.toFixed(1)}" y1="${axisY}" x2="${x.toFixed(1)}" y2="${axisY + 4}" stroke="rgba(24,34,45,0.3)" stroke-width="1" />`);
-    svgParts.push(`<text x="${x.toFixed(1)}" y="${axisY + 15}" text-anchor="${i === 0 ? "start" : i === 4 ? "end" : "middle"}" fill="#5b6672" font-size="11" font-family="IBM Plex Sans">${formatCoord(pos)}</text>`);
-  }
-
-  svgParts.push("</svg>");
-  isZoomedIn = true; // block background renders while zoomed
-  selectedChromosomeVisual.innerHTML = svgParts.join("");
-  selectedChromosomeVisualNote.textContent = `Zoomed: ${formatCoord(viewStart)} – ${formatCoord(viewEnd)} · ${orfs.length} candidate ORFs · ${cpgs.length} CpG sites`;
-
-  // Zoom-out button restores overview
-  selectedChromosomeVisual.querySelectorAll(".zoom-out-btn").forEach((el) => {
-    el.addEventListener("click", (e) => {
-      e.stopPropagation();
-      // Cancel any background ORF/CpG fetch so it can't overwrite the overview
-      if (zoomAbortController) { zoomAbortController.abort(); zoomAbortController = null; }
-      activeOrfItems = [];
-      activeCpgItems = [];
-      renderSelectedChromosomeVisual();
-    });
-  });
-
-  // Tooltips for zoomed ORFs
-  const tip = getOrCreateTooltip();
-  const moveTip = (e) => { tip.style.left = `${e.clientX + 14}px`; tip.style.top = `${e.clientY - 8}px`; };
-  const hideTip = () => { tip.style.display = "none"; };
-
-  selectedChromosomeVisual.querySelectorAll(".zoom-orf").forEach((el) => {
-    el.addEventListener("mouseenter", (e) => {
-      tip.innerHTML = `ORF ${formatCoord(+el.dataset.start)} – ${formatCoord(+el.dataset.end)}<br>Length: ${el.dataset.len ? `${Number(el.dataset.len).toLocaleString()} bp` : "n/a"} &nbsp;·&nbsp; Strand: ${el.dataset.strand}`;
-      tip.style.display = "block";
-      moveTip(e);
-    });
-    el.addEventListener("mousemove", moveTip);
-    el.addEventListener("mouseleave", hideTip);
-  });
-
-  selectedChromosomeVisual.querySelectorAll(".zoom-cpg").forEach((el) => {
-    el.addEventListener("mouseenter", (e) => {
-      tip.innerHTML = `CpG at ${formatCoord(+el.dataset.start)}`;
-      tip.style.display = "block";
-      moveTip(e);
-    });
-    el.addEventListener("mousemove", moveTip);
-    el.addEventListener("mouseleave", hideTip);
-  });
+  }, 30000);
 }
 
 function buildSinglePayload(form) {
@@ -1250,7 +1506,11 @@ async function fetchJson(path) {
     return null;
   }
 
-  const response = await fetch(`${API_BASE_URL}${path}`);
+  const separator = path.includes("?") ? "&" : "?";
+  const cacheBustedPath = `${path}${separator}_ts=${Date.now()}`;
+  const response = await fetch(`${API_BASE_URL}${cacheBustedPath}`, {
+    cache: "no-store",
+  });
   if (!response.ok) {
     throw new Error(`Request failed: ${response.status}`);
   }
@@ -1276,9 +1536,12 @@ async function postJson(path, payload = {}) {
   return data;
 }
 
-async function loadChromosomeDetails(chromosome) {
-  setSelectedChromosome(chromosome);
-  const live = chromosomeState(chromosome);
+async function loadChromosomeDetails(chromosome, options = {}) {
+  if (!options.preserveFocus) {
+    setSelectedChromosome(chromosome);
+  }
+  stopBatchStatusPolling();
+  showLoadingChromosome(chromosome);
 
   if (!API_BASE_URL) {
     if (chromosome !== DEFAULT_CHROMOSOME) {
@@ -1287,74 +1550,64 @@ async function loadChromosomeDetails(chromosome) {
     return;
   }
 
-  if (!live.ready) {
-    showUnavailableChromosome(chromosome);
-    return;
-  }
+  try {
+    const [summary, batchStatus, operations] = await Promise.all([
+      fetchJson(`/api/chromosomes/${chromosome}/summary`),
+      fetchJson(`/api/chromosomes/${chromosome}/batch-status`).catch(() => null),
+      fetchJson(`/api/chromosomes/${chromosome}/operations`).catch(() => null),
+    ]);
 
-  // Clear stale pattern badges from any previous chromosome immediately
-  activePatternItems = [];
-  activeRegionItems = [];
-  activeOrfItems = [];
-  activeCpgItems = [];
-  patternRows.length = 0;
-  orfRows.length = 0;
-  gcValues.length = 0;
-  renderPatternTable();
-  renderOrfTable();
-  renderGcBars();
-  renderSelectedChromosomeVisual();
+    applyOperations(chromosome, operations);
+    applyBatchStatus(chromosome, batchStatus);
 
-  // Show immediate loading feedback
-  selectedChromosomeStatus.textContent = `Loading chromosome ${chromosome} data…`;
-  selectedChromosomeVisualNote.textContent = `Fetching analysis data for chromosome ${chromosome}…`;
-
-  // Use individual .catch() so one slow/failed endpoint doesn't clear all data
-  const [summary, patterns, regions] = await Promise.all([
-    fetchJson(`/api/chromosomes/${chromosome}/summary`).catch(e => { console.warn("summary failed", e); return null; }),
-    fetchJson(`/api/chromosomes/${chromosome}/patterns`).catch(e => { console.warn("patterns failed", e); return null; }),
-    fetchJson(`/api/chromosomes/${chromosome}/regions?limit=5000`).catch(e => { console.warn("regions failed", e); return null; }),
-  ]);
-
-  if (!summary && !patterns && !regions) {
-    // All three failed — chromosome truly unavailable
-    showUnavailableChromosome(chromosome);
-    return;
-  }
-
-  if (summary) applySummary(summary);
-  // Only replace existing data with non-empty results — empty arrays from Athena cold/miss
-  // must not clear a visualization that is already showing correctly
-  if (patterns && Array.isArray(patterns.items) && patterns.items.length > 0) applyPatterns(patterns.items);
-  if (regions && Array.isArray(regions.items) && regions.items.length > 0) {
-    applyRegions(regions.items);
-  } else if (summary && Number(summary.pattern_hit_count || 0) > 0) {
-    selectedChromosomeVisualNote.textContent =
-      `Analysis data exists for chromosome ${chromosome}, but region windows have not loaded yet. Retrying sync…`;
-    if (API_BASE_URL && window._regionRepairing !== chromosome) {
-      window._regionRepairing = chromosome;
-      fetch(`${API_BASE_URL}/api/chromosomes/${chromosome}/sync`, { method: "POST" })
-        .then(() => {
-          setTimeout(() => {
-            window._regionRepairing = null;
-            loadChromosomeDetails(chromosome).catch((e) => console.warn("region reload failed", e));
-          }, 4000);
-        })
-        .catch((e) => {
-          window._regionRepairing = null;
-          console.warn("region sync retry failed", e);
-        });
+    if (summary) {
+      applySummary(summary);
     }
-  }
 
-  renderChromosomeGrid();
-  startBatchPollingIfNeeded(chromosome);
+    const liveAfterStatus = chromosomeState(chromosome);
+    if (!summary || !liveAfterStatus.ready) {
+      showUnavailableChromosome(chromosome);
+      return;
+    }
+
+    const [patterns, regions] = await Promise.all([
+      fetchJson(`/api/chromosomes/${chromosome}/patterns`).catch(() => null),
+      fetchJson(`/api/chromosomes/${chromosome}/regions?limit=5000`).catch(() => null),
+    ]);
+
+    if (patterns && Array.isArray(patterns.items)) {
+      applyPatterns(patterns.items);
+    } else {
+      activePatternItems = [];
+      patternRows.length = 0;
+      renderPatternTable();
+    }
+
+    if (regions && Array.isArray(regions.items)) {
+      applyRegions(regions.items);
+    } else {
+      activeRegionItems = [];
+      orfRows.length = 0;
+      gcValues.length = 0;
+      renderOrfTable();
+      renderGcBars();
+      renderSelectedChromosomeVisual();
+    }
+
+    renderChromosomeGrid();
+    scheduleBatchStatusPolling(chromosome);
+  } catch (error) {
+    console.warn(`Unable to load chromosome ${chromosome} data.`, error);
+    showUnavailableChromosome(chromosome);
+  }
 }
 
 async function hydrateDashboard() {
   if (!API_BASE_URL) {
     return;
   }
+
+  const detailPromise = loadChromosomeDetails(activeChromosome, { preserveFocus: true });
 
   try {
     const [overview, chromosomes] = await Promise.all([
@@ -1372,84 +1625,10 @@ async function hydrateDashboard() {
   } catch (error) {
     console.warn("Dashboard API unavailable, using local placeholder data.", error);
   }
-
-  await loadChromosomeDetails(activeChromosome);
-}
-
-let batchPollTimer = null;
-
-function stopBatchPolling() {
-  if (batchPollTimer) { clearInterval(batchPollTimer); batchPollTimer = null; }
-}
-
-async function pollBatchStatus(chromosome) {
-  if (!API_BASE_URL) return;
-  try {
-    const bs = await fetchJson(`/api/chromosomes/${chromosome}/batch-status`);
-    const item = chromosomeState(chromosome);
-    if (!item) return;
-
-    chromosomeInventory.set(chromosome, { ...item, batchStatus: bs });
-
-    if (chromosome === activeChromosome) {
-      updateSelectionMeta(chromosomeState(chromosome));
-    }
-
-    // Stop polling once done or failed
-    if (bs.status === "SUCCEEDED" || bs.status === "FAILED" || bs.status === "no_job") {
-      stopBatchPolling();
-    if (bs.status === "SUCCEEDED") {
-        // Reload chromosome data — results should now be in S3/Athena
-        // Trigger MSCK REPAIR + cache clearing — /sync waits for Athena before returning
-        // Show progress in the status cards so the user knows what's happening
-        const syncMsg = "Syncing Athena partitions… (~30s)";
-        if (selectedPatternDetail) selectedPatternDetail.textContent = syncMsg;
-        if (selectedRegionDetail) selectedRegionDetail.textContent = syncMsg;
-        showAthenaLoadingState(chromosome, chromosomeState(chromosome), 88, "Syncing Athena");
-        if (API_BASE_URL) {
-          fetch(`${API_BASE_URL}/api/chromosomes/${chromosome}/sync`, { method: "POST" })
-            .then(() => {
-              if (selectedPatternDetail) selectedPatternDetail.textContent = "Sync complete — loading results…";
-              if (selectedRegionDetail) selectedRegionDetail.textContent = "Sync complete — loading results…";
-              showAthenaLoadingState(chromosome, chromosomeState(chromosome), 95);
-              setTimeout(() => hydrateDashboard(), 5000);
-            })
-            .catch(e => { console.warn("sync failed", e); setTimeout(() => hydrateDashboard(), 10000); });
-        } else {
-          setTimeout(() => hydrateDashboard(), 10000);
-        }
-      }
-    }
-  } catch (err) {
-    console.warn("Batch status poll failed:", err);
-  }
-}
-
-function startBatchPollingIfNeeded(chromosome) {
-  stopBatchPolling();
-  const item = chromosomeState(chromosome);
-  if (!item || !item.ready) return;
-  if (item.patternsReady && item.regionsReady) return;
-  if (!API_BASE_URL) return;
-
-  // Start polling immediately then every 30s
-  pollBatchStatus(chromosome);
-  batchPollTimer = setInterval(() => pollBatchStatus(chromosome), 30000);
+  await detailPromise;
 }
 
 function handleChromosomeSelection(chromosome) {
-  stopBatchPolling();
-  if (zoomAbortController) { zoomAbortController.abort(); zoomAbortController = null; }
-  // Clear stale pattern badges from the previous chromosome
-  activePatternItems = [];
-  activeRegionItems = [];
-  patternRows.length = 0;
-  orfRows.length = 0;
-  gcValues.length = 0;
-  showSummaryLoadingState(chromosome, "Loading…");
-  renderPatternTable();
-  renderOrfTable();
-  renderGcBars();
   loadChromosomeDetails(chromosome);
 }
 
@@ -1470,11 +1649,6 @@ async function handleRunFullAnalysis() {
       ? "AWS Batch on Fargate"
       : "the Lambda queue";
     runFullAnalysisHint.textContent = `Full analysis for chromosome ${activeChromosome} was submitted to ${backend}.`;
-    if (backend === "AWS Batch on Fargate") {
-      // Give Batch 2 seconds to register the job, then start polling
-      const chr = activeChromosome;
-      setTimeout(() => startBatchPollingIfNeeded(chr), 2000);
-    }
   } catch (error) {
     console.warn(`Unable to submit full analysis for chromosome ${activeChromosome}.`, error);
     runFullAnalysisHint.textContent = error.message;
@@ -1504,11 +1678,7 @@ runFullAnalysisButton.addEventListener("click", () => {
 });
 
 setSelectedChromosome(activeChromosome);
-showSummaryLoadingState(activeChromosome, "Loading…");
-renderPatternTable();
-renderOrfTable();
-renderGcBars();
-renderChromosomeAtlas();
-renderSelectedChromosomeVisual();
+showLoadingChromosome(activeChromosome);
 renderPreview(buildSinglePayload(singleJobForm.elements));
 hydrateDashboard();
+syncTableScrollIndicators();

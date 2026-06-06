@@ -1,136 +1,166 @@
-# Troubleshooting Log
+# Troubleshooting Guide
 
-This document records significant bugs encountered during development and the root causes found.
+This guide captures the main issues encountered while building and operating the BioIT Genome Pipeline, along with the fixes used in the live AWS environment.
 
----
+## 1. SQS Messages Were Accepted but Jobs Failed Immediately
 
-## Chromosome Lens Visualization — Revert and Click Issues
+### Symptom
 
-**Symptom:** After selecting a chromosome with full analysis data, the lens visualization would intermittently revert to a "Run or finish full analysis" placeholder state. The ideogram was also non-clickable after page refresh or after navigating between chromosomes.
+- queue submissions appeared successful
+- Lambda failed right away
+- some jobs ended in the DLQ
 
-Three separate bugs were contributing to the same symptom.
+### Root Cause
 
----
+The Lambda handler originally expected direct payloads and did not correctly unwrap SQS `Records[*].body`.
 
-### Bug 1 — Stale SVG reference in click handler
+### Fix
 
-**Symptom:** Lens not clickable after hard refresh or after any zoom-in/zoom-out cycle.
+- updated the handler to support both direct invocation and SQS event shapes
+- documented safer queue submission patterns
+- preferred JSON file or Python-generated payloads over hand-built shell JSON
 
-**Root cause:** `attachGenomeTrackEvents` captured the SVG element in a closure at listener-creation time:
+## 2. Athena Queries Worked but the Wrong Database Was Selected
 
-```javascript
-const svg = selectedChromosomeVisual.querySelector("svg");  // captured once
-...
-function inIdeogram(e) {
-    const r = svg.getBoundingClientRect();  // stale reference
-```
+### Symptom
 
-Every time `renderSelectedChromosomeVisual()` or `renderZoomedGenomeTrack()` was called, it replaced `selectedChromosomeVisual.innerHTML`. This detached the captured `svg` element from the DOM. A detached element returns `{width: 0, height: 0}` from `getBoundingClientRect()`, causing `inIdeogram()` to always return `false` — so every click was silently dropped.
+- tables appeared to be missing in Athena
+- saved queries returned no rows
 
-**Fix:** Changed to query the live DOM at event time:
+### Root Cause
 
-```javascript
-function currentSvg() {
-    return selectedChromosomeVisual.querySelector("svg");
-}
-function inIdeogram(e) {
-    const s = currentSvg();
-    if (!s || !s.getBoundingClientRect().width) return false;
-    const r = s.getBoundingClientRect();
-    ...
-}
-```
+Athena Query Editor had reset to the default database instead of `genome_pipeline_db`.
 
----
+### Fix
 
-### Bug 2 — Background Athena fetch overwriting the overview after zoom-out
+- confirmed the live tables existed in `genome_pipeline_db`
+- documented the database switch in the README
+- used `MSCK REPAIR TABLE` when partitions had not yet been registered
 
-**Symptom:** User zooms into a region → clicks ← Zoom out → overview briefly appears → then the zoomed view reappears on its own.
+## 3. Lambda Full Analysis Stalled at 96%
 
-**Root cause:** `zoomToGenomeRegion` rendered the zoomed frame immediately and then started an async Athena query for individual ORF/CpG positions (chr5 has ~5.8M pattern rows — query takes 30–55 seconds). When the user clicked zoom-out before the query finished, `renderSelectedChromosomeVisual()` restored the overview. But 30–55 seconds later the background query completed, called `renderZoomedGenomeTrack()` again, and replaced the overview with the stale zoomed view.
+### Symptom
 
-Clicking zoom-out again would restore the overview, but the next pending background query (from a prior click) would overwrite it again — creating an endless loop.
+- dashboard showed jobs stuck around `96%`
+- elapsed time kept growing
+- no final output landed
 
-**Fix:** Added `AbortController` to `zoomToGenomeRegion`. Each new zoom call cancels the previous fetch. Zoom-out and chromosome selection also abort any pending fetch:
+### Root Cause
 
-```javascript
-async function zoomToGenomeRegion(chromosome, regionStart, regionEnd) {
-  if (zoomAbortController) zoomAbortController.abort();
-  zoomAbortController = new AbortController();
-  const signal = zoomAbortController.signal;
+Large or memory-heavy full-chromosome runs were not actually still progressing. Some Lambda jobs were retrying or dying from runtime limits, including memory pressure.
 
-  renderZoomedGenomeTrack(...);  // immediate
+### Fix
 
-  const [orfRes, cpgRes] = await Promise.all([
-    fetch(orfUrl, { signal }).then(...).catch(() => null),
-    fetch(cpgUrl, { signal }).then(...).catch(() => null),
-  ]);
+- moved full-analysis routing to AWS Batch on Fargate
+- removed the misleading Lambda cutoff logic from the dashboard and API
+- kept Lambda focused on lighter ingestion and orchestration work
 
-  if (signal.aborted) return;  // zoom-out was clicked — discard results
-  ...
-}
-```
+## 4. Batch Finished but Dashboard Still Looked Pending
 
----
+### Symptom
 
-### Bug 3 — Empty API response clearing the loaded visualization
+- Batch job succeeded
+- dashboard still showed pending or loading states
 
-**Symptom:** After the visualization loaded correctly, it would revert to the null/placeholder state. The summary card still showed the correct pattern count, but the analysis window track showed "Run or finish full analysis."
+### Root Cause
 
-**Root cause:** `hydrateDashboard()` triggers a second `loadChromosomeDetails()` call after the initial page load. This second call fetches patterns and regions again. If the DynamoDB cache had expired and the Athena query ran cold or hit a partition miss, the regions endpoint returned `{items: []}` — an empty array. The check `Array.isArray(regions.items)` passes for `[]`, so `applyRegions([])` was called, setting `activeRegionItems = []` and triggering the placeholder state.
+Operational state and Athena-backed summaries were not always synchronized cleanly, especially after retries or re-submissions.
 
-The visualization had already loaded correctly from the first call; the second call silently erased it.
+### Fix
 
-**Fix:** Added a length guard so only non-empty results replace existing data:
+- added DynamoDB-backed operational tracking
+- stored submission, start, finish, backend, progress, and output paths
+- reset stale status fields on re-submission
+- improved dashboard messaging for Batch, Athena sync, and completion
 
-```javascript
-// Before (would clear with empty array)
-if (regions && Array.isArray(regions.items)) applyRegions(regions.items);
+## 5. Summary Card Showed `0 ORFs` Even When the Lens Had ORFs
 
-// After (preserves existing data if API returns empty)
-if (regions && Array.isArray(regions.items) && regions.items.length > 0) applyRegions(regions.items);
-```
+### Symptom
 
-The same guard was applied to `applyPatterns`. A similar guard was added in `cache_put` in `web_api_handler.py` so that DynamoDB never caches an empty `{items:[]}` response — which would poison the cache for an hour.
+- summary card displayed `0 window ORFs`
+- lower visualization clearly showed ORF bars
 
----
+### Root Cause
 
-### Related fix — CloudFront caching stale "pending" responses
+The summary API was summing only the first few preview windows instead of the full chromosome-wide region dataset.
 
-**Symptom:** After a Batch full-analysis job completed successfully, the dashboard continued showing "Pending" for patterns and regions (even on refresh) for up to 1 hour.
+### Fix
 
-**Root cause:** When a chromosome was first selected while analysis was still pending, CloudFront cached the `/api/chromosomes/{chr}/patterns` and `/api/chromosomes/{chr}/regions` responses with a 1-hour TTL. After the analysis completed and Athena partitions were synced, CloudFront was still serving the old empty responses.
+- replaced preview-based totals with dedicated aggregate Athena queries
+- added a regression test for chromosomes whose early windows are zero but later windows contain ORFs
 
-**Fix:** Added automatic CloudFront cache invalidation to `trigger_partition_repair()` in `lambda_handler.py`. After every Batch job completes, it now:
-1. Runs `MSCK REPAIR TABLE` for each affected Glue table (syncs Athena partitions)
-2. Creates a CloudFront invalidation for `/api/chromosomes` and `/api/chromosomes/{chr}/*`
+## 6. Lens Visualization Looked Empty or Incomplete
 
-This ensures the dashboard sees fresh data within seconds of job completion.
+### Symptom
 
----
+- lens showed only a narrow early-region slice
+- tooltip values looked static
+- later windows were missing
 
-## Athena Partition Sync
+### Root Cause
 
-**Symptom:** After a Batch job completed successfully (patterns and regions data in S3), the dashboard showed "0 hits" and "0 window ORFs" in the summary card.
+The regions API route was not honoring the requested `limit` correctly, so the frontend only received a truncated early segment.
 
-**Root cause:** AWS Glue does not automatically discover new S3 partitions when Parquet files are written. The Athena tables (`genome_sequences`, `sequence_patterns`, `sequence_regions`) had no knowledge of the new data until `MSCK REPAIR TABLE` was run.
+### Fix
 
-**Fix:** `trigger_partition_repair()` in `lambda_handler.py` was added to fire `MSCK REPAIR TABLE` asynchronously at the end of every successful pipeline job. It was later extended to also invalidate CloudFront and DynamoDB cache entries.
+- updated the regions route to respect `limit`
+- redeployed the web API
+- verified the lens could now render full chromosome span samples
 
----
+## 7. Dashboard Looked Correct Locally but Not in the Live URL
 
-## DynamoDB Cache Poisoning
+### Symptom
 
-**Symptom:** After deploying DynamoDB caching, chromosomes that had completed analysis continued showing empty data for an hour.
+- local source had the new UI
+- CloudFront dashboard still showed the older version
 
-**Root cause:** The first API request after analysis completion (while `MSCK REPAIR TABLE` was still running) hit Athena before the partitions were synced, received `{items:[]}`, and wrote the empty response to DynamoDB with a 1-hour TTL. All subsequent requests served the empty cached response.
+### Root Cause
 
-**Fix:** `cache_put()` was modified to skip writes when `items` is an empty list. Empty results from Athena indicate "not ready yet" rather than "genuinely empty," so they should always fall through to a fresh Athena query.
+Frontend source changes had not yet been copied into the Terraform deployment bundle or CloudFront was still serving cached assets.
 
-```python
-def cache_put(key, data, ttl_seconds=3600):
-    items = data.get("items")
-    if isinstance(items, list) and len(items) == 0:
-        return  # never cache empty results
-    ...
-```
+### Fix
+
+- copied updated `webapp` files into `dist/terraform/webapp`
+- applied the dashboard S3 object changes
+- invalidated CloudFront for `app.js`, `styles.css`, and related assets
+
+## 8. Full Analysis Needed Better Progress Visibility
+
+### Symptom
+
+- dashboard only showed generic pending states
+- hard to tell whether work was starting, running, syncing, or done
+
+### Root Cause
+
+The original UI relied mostly on dataset presence instead of explicit operational status.
+
+### Fix
+
+- added progress-aware status cards
+- surfaced Batch start/running/success states
+- added Athena sync messaging after Batch completion
+- used DynamoDB to back more of the dashboard’s live status
+
+## 9. Candidate Coding Regions Tables Looked Like They Had Two Scrollbars
+
+### Symptom
+
+- each table appeared to have two vertical rails
+
+### Root Cause
+
+The UI had both:
+
+- the native browser scrollbar
+- a custom always-visible overlay scrollbar
+
+### Fix
+
+- removed the overlay scrollbar
+- kept a single styled native scrollbar
+
+## 10. Key Operational Lesson
+
+For small demonstrations, Lambda can be useful. For full-chromosome processing with richer analysis and more consistent runtime behavior, AWS Batch on Fargate proved to be the better execution model in this project.
+
