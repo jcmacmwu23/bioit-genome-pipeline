@@ -80,6 +80,7 @@ source=<source>/species=<species>/chr=<chromosome>/year=<YYYY>/month=<MM>/
 Live environment in this project:
 
 - Dashboard: [CloudFront dashboard](https://d11q5vlaasogkc.cloudfront.net/)
+- Compact dashboard: [CloudFront compact dashboard](https://d11q5vlaasogkc.cloudfront.net/compact.html)
 - API base: `https://7e4jzpfr2d.execute-api.us-east-1.amazonaws.com`
 
 The dashboard supports:
@@ -90,6 +91,8 @@ The dashboard supports:
 - selected chromosome lens
 - candidate ORF and CpG density views
 - pattern and region summaries
+
+The compact dashboard is a second recruiter-friendly presentation layer built on the same API and datasets. It keeps the chromosome overview, summary cards, atlas, lens, and analysis widgets while reducing hero/header height and overall scroll depth.
 
 ## Athena Tables
 

@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BioIT Genome Intelligence Dashboard - Compact</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="compact-dashboard">
+    <div class="page-shell">
+      <header class="hero hero-compact">
+        <div class="hero-copy compact-hero-copy">
+          <p class="eyebrow">BioIT Genome Intelligence</p>
+          <h1>Human genome analysis dashboard</h1>
+          <p class="hero-text compact-hero-text">
+            A compact reviewer-friendly view of chromosome completion, C++ analysis summaries,
+            and the selected chromosome lens.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#chromosomes">Open Chromosomes</a>
+            <a class="button button-secondary" href="./index.html">Open Full Dashboard</a>
+          </div>
+        </div>
+        <aside class="hero-panel compact-hero-panel">
+          <div class="hero-panel-grid compact-hero-grid">
+            <article class="metric-card">
+              <span class="metric-label">Chromosomes Ready</span>
+              <strong id="readyChromosomes">0 / 24</strong>
+              <span class="metric-detail">Full chromosome coverage in S3</span>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Queue Backlog</span>
+              <strong id="queueDepth">0 pending</strong>
+              <span class="metric-detail">Live API backlog</span>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Pattern Dataset</span>
+              <strong>Active</strong>
+              <span class="metric-detail">Motifs, repeats, candidate ORFs</span>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Region Dataset</span>
+              <strong>Active</strong>
+              <span class="metric-detail">GC, repeats, ORF windows</span>
+            </article>
+          </div>
+        </aside>
+      </header>
+
+      <main class="content compact-content">
+        <section class="panel compact-panel" id="chromosomes">
+          <div class="section-header compact-section-header">
+            <div>
+              <p class="section-kicker">Chromosomes</p>
+              <h2>Completion, summary, and lens</h2>
+            </div>
+            <p class="section-copy">
+              The compact layout keeps the most useful project evidence above the fold:
+              chromosome completion, summary metrics, and the interactive lens visualization.
+            </p>
+          </div>
+
+          <div class="selection-banner">
+            <span class="selection-label">Selected chromosome</span>
+            <strong id="selectedChromosomeLabel">22</strong>
+            <span id="selectedChromosomeStatus" class="selection-status">Loading live analysis</span>
+          </div>
+
+          <div class="selection-meta">
+            <article class="selection-card">
+              <span class="metric-label">Sequence Status</span>
+              <strong id="selectedSequenceStatus">Ready</strong>
+              <span id="selectedSequenceDetail" class="metric-detail">Latest sequence output available</span>
+            </article>
+            <article class="selection-card">
+              <span class="metric-label">Pattern Status</span>
+              <strong id="selectedPatternStatus">Ready</strong>
+              <span id="selectedPatternDetail" class="metric-detail">Pattern leaderboard can be queried</span>
+            </article>
+            <article class="selection-card">
+              <span class="metric-label">Region Status</span>
+              <strong id="selectedRegionStatus">Ready</strong>
+              <span id="selectedRegionDetail" class="metric-detail">GC and ORF windows are available</span>
+            </article>
+            <article class="selection-card">
+              <span class="metric-label">Full Analysis Path</span>
+              <strong id="selectedFullAnalysisStatus">Eligible</strong>
+              <span id="selectedFullAnalysisDetail" class="metric-detail">Batch-first full analysis routing.</span>
+            </article>
+          </div>
+
+          <div class="selection-actions">
+            <button id="runFullAnalysisButton" class="button button-primary" type="button">
+              Run Full Analysis
+            </button>
+            <span id="runFullAnalysisHint" class="selection-status">
+              Use this when sequence data is landed and you want patterns plus region summaries.
+            </span>
+          </div>
+
+          <div class="chromosome-layout">
+            <article class="card">
+              <h3>Completion map</h3>
+              <div id="chromosomeGrid" class="chromosome-grid"></div>
+            </article>
+
+            <article class="card summary-atlas-card">
+              <div class="summary-atlas-layout">
+                <div class="summary-block">
+                  <h3>Chromosome summary</h3>
+                  <div id="summaryCards" class="summary-cards"></div>
+                </div>
+                <div class="atlas-inline">
+                  <h3>Chromosome atlas</h3>
+                  <div id="chromosomeAtlas" class="visual-stage visual-stage-atlas"></div>
+                </div>
+              </div>
+            </article>
+          </div>
+
+          <article class="card visual-card lens-card">
+            <h3>Selected chromosome lens</h3>
+            <p class="card-caption">
+              A focused ideogram and analysis lens built from the chromosome’s region-level outputs.
+            </p>
+            <div id="selectedChromosomeVisual" class="visual-stage visual-stage-focus"></div>
+            <p id="selectedChromosomeVisualNote" class="chart-note">
+              Load a chromosome to inspect its ideogram and region-level analysis windows.
+            </p>
+          </article>
+        </section>
+
+        <section class="panel compact-panel" id="analysis">
+          <div class="section-header compact-section-header">
+            <div>
+              <p class="section-kicker">Analysis</p>
+              <h2>C++ results at a glance</h2>
+            </div>
+            <p class="section-copy">
+              Pattern hits, candidate coding regions, and regional GC/ORF behavior for the selected chromosome.
+            </p>
+          </div>
+
+          <div class="analysis-grid analysis-grid-tables">
+            <article class="card">
+              <h3>Pattern leaderboard</h3>
+              <div class="table-scroll-frame">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Pattern</th>
+                      <th>Type</th>
+                      <th>Hits</th>
+                    </tr>
+                  </thead>
+                  <tbody id="patternTable"></tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="card">
+              <h3>Candidate coding regions</h3>
+              <div class="table-scroll-frame">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Window</th>
+                      <th>GC %</th>
+                      <th>ORFs</th>
+                    </tr>
+                  </thead>
+                  <tbody id="orfTable"></tbody>
+                </table>
+              </div>
+            </article>
+          </div>
+
+          <article class="card analysis-chart-card">
+            <h3>Region chart preview</h3>
+            <div class="chart-card">
+              <div id="gcBars" class="bar-chart"></div>
+              <p id="regionChartNote" class="chart-note">
+                GC-content windows for the selected chromosome.
+              </p>
+            </div>
+          </article>
+        </section>
+
+        <section class="support-hidden" aria-hidden="true">
+          <form id="singleJobForm">
+            <input name="source" value="ncbi" />
+            <input name="accessionId" value="NC_000022.11" />
+            <input name="chromosome" value="22" />
+            <input name="species" value="homo_sapiens" />
+            <input name="outputPrefix" value="human_genome/chr22" />
+          </form>
+          <button id="submitBatchButton" type="button">Hidden batch control</button>
+          <pre id="payloadPreview"></pre>
+        </section>
+      </main>
+    </div>
+
+    <script src="./config.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

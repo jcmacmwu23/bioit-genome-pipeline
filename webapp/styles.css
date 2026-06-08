@@ -206,6 +206,74 @@ dt {
   gap: 22px;
 }
 
+.support-hidden {
+  display: none;
+}
+
+.compact-dashboard .page-shell {
+  width: min(1320px, calc(100% - 24px));
+  padding-top: 18px;
+}
+
+.compact-dashboard .hero {
+  grid-template-columns: 1.1fr 0.95fr;
+  gap: 16px;
+}
+
+.compact-dashboard .hero-copy {
+  padding: 24px 28px;
+}
+
+.compact-dashboard .hero-panel {
+  padding: 16px;
+}
+
+.compact-dashboard h1 {
+  font-size: clamp(2rem, 4.2vw, 3.4rem);
+  max-width: 14ch;
+}
+
+.compact-dashboard .hero-text {
+  margin: 12px 0 18px;
+  line-height: 1.5;
+  font-size: 0.98rem;
+  max-width: 54ch;
+}
+
+.compact-dashboard .hero-panel-grid {
+  gap: 12px;
+}
+
+.compact-dashboard .metric-card,
+.compact-dashboard .card {
+  padding: 16px;
+}
+
+.compact-dashboard .content {
+  margin-top: 16px;
+  gap: 16px;
+}
+
+.compact-dashboard .panel {
+  padding: 20px;
+}
+
+.compact-dashboard .section-header {
+  margin-bottom: 16px;
+}
+
+.compact-dashboard .selection-meta {
+  gap: 12px;
+}
+
+.compact-dashboard .chromosome-layout {
+  gap: 12px;
+}
+
+.compact-dashboard .visual-stage-focus {
+  min-height: 320px;
+}
+
 .panel {
   border-radius: var(--radius-xl);
   padding: 28px;
