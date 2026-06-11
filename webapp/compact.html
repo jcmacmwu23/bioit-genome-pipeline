@@ -17,40 +17,19 @@
       <header class="hero hero-compact">
         <div class="hero-copy compact-hero-copy">
           <p class="eyebrow">BioIT Genome Intelligence</p>
-          <h1>Human genome analysis dashboard</h1>
+          <h1>AWS data lake pipeline for human genome analysis</h1>
           <p class="hero-text compact-hero-text">
-            A compact reviewer-friendly view of chromosome completion, C++ analysis summaries,
-            and the selected chromosome lens.
+            An end-to-end data pipeline that pulls chromosome sequences from the NCBI API,
+            processes them through a high-performance C++ FASTA parser running on Lambda
+            and AWS Batch, and lands Parquet datasets in an S3 data lake, queryable via
+            Athena and visualized here.
           </p>
           <div class="hero-actions">
             <a class="button button-primary" href="#chromosomes">Open Chromosomes</a>
             <a class="button button-secondary" href="./index.html">Open Full Dashboard</a>
+            <a class="button button-secondary" href="#glossary">Glossary</a>
           </div>
         </div>
-        <aside class="hero-panel compact-hero-panel">
-          <div class="hero-panel-grid compact-hero-grid">
-            <article class="metric-card">
-              <span class="metric-label">Chromosomes Ready</span>
-              <strong id="readyChromosomes">0 / 24</strong>
-              <span class="metric-detail">Full chromosome coverage in S3</span>
-            </article>
-            <article class="metric-card">
-              <span class="metric-label">Queue Backlog</span>
-              <strong id="queueDepth">0 pending</strong>
-              <span class="metric-detail">Live API backlog</span>
-            </article>
-            <article class="metric-card">
-              <span class="metric-label">Pattern Dataset</span>
-              <strong>Active</strong>
-              <span class="metric-detail">Motifs, repeats, candidate ORFs</span>
-            </article>
-            <article class="metric-card">
-              <span class="metric-label">Region Dataset</span>
-              <strong>Active</strong>
-              <span class="metric-detail">GC, repeats, ORF windows</span>
-            </article>
-          </div>
-        </aside>
       </header>
 
       <main class="content compact-content">
@@ -58,11 +37,10 @@
           <div class="section-header compact-section-header">
             <div>
               <p class="section-kicker">Chromosomes</p>
-              <h2>Completion, summary, and lens</h2>
+              <h2>Completion map and per-chromosome summaries</h2>
             </div>
             <p class="section-copy">
-              The compact layout keeps the most useful project evidence above the fold:
-              chromosome completion, summary metrics, and the interactive lens visualization.
+              Chromosome completion, summary metrics, and the interactive lens visualization.
             </p>
           </div>
 
@@ -127,7 +105,9 @@
           <article class="card visual-card lens-card">
             <h3>Selected chromosome lens</h3>
             <p class="card-caption">
-              A focused ideogram and analysis lens built from the chromosome’s region-level outputs.
+              A focused ideogram plus an analysis window track built from the current
+              region-level outputs for the selected chromosome, with both broad scroll view
+              and a deeper clickable zoomed detail mode.
             </p>
             <div id="selectedChromosomeVisual" class="visual-stage visual-stage-focus"></div>
             <p id="selectedChromosomeVisualNote" class="chart-note">
@@ -192,7 +172,32 @@
           </article>
         </section>
 
+        <section class="panel compact-panel" id="glossary">
+          <div class="section-header compact-section-header">
+            <div>
+              <p class="section-kicker">Glossary</p>
+              <h2>Key biology and data terms</h2>
+            </div>
+            <p class="section-copy">
+              Quick definitions for the biology and data terms used throughout the dashboard.
+            </p>
+          </div>
+
+          <div class="glossary-grid glossary-grid-compact">
+            <article class="glossary-card"><h3>ORF</h3><p>Open reading frame: a sequence stretch that looks like a possible protein-coding region.</p></article>
+            <article class="glossary-card"><h3>CpG</h3><p>A cytosine followed by guanine on the same DNA strand, often important in gene regulation.</p></article>
+            <article class="glossary-card"><h3>GC content</h3><p>The percentage of bases that are G or C in a region.</p></article>
+            <article class="glossary-card"><h3>Motif</h3><p>A short recurring DNA pattern that may have biological meaning.</p></article>
+            <article class="glossary-card"><h3>Repeat</h3><p>A sequence that appears multiple times, including low-complexity runs and other recurring patterns.</p></article>
+            <article class="glossary-card"><h3>Parquet</h3><p>A columnar analytics file format used for the project’s S3 data lake outputs.</p></article>
+            <article class="glossary-card"><h3>Athena</h3><p>The AWS SQL engine used to query those S3 Parquet datasets.</p></article>
+            <article class="glossary-card"><h3>Genomic window</h3><p>A fixed-size chromosome slice used for regional summaries such as GC%, ORFs, and motif counts.</p></article>
+          </div>
+        </section>
+
         <section class="support-hidden" aria-hidden="true">
+          <span id="readyChromosomes">0 / 24</span>
+          <span id="queueDepth">0 pending</span>
           <form id="singleJobForm">
             <input name="source" value="ncbi" />
             <input name="accessionId" value="NC_000022.11" />

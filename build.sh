@@ -39,8 +39,9 @@ docker run --rm \
         set -e
         yum install -y gcc-c++ wget 2>&1 | tail -5
         echo 'Downloading nlohmann/json...'
+        mkdir -p /build/nlohmann
         wget -q https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp \
-             -O /build/json.hpp
+             -O /build/nlohmann/json.hpp
         echo 'Compiling...'
         g++ -O3 -std=c++17 \
             -I/build \

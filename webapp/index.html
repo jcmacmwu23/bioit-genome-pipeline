@@ -27,6 +27,7 @@
           <div class="hero-actions">
             <a class="button button-primary" href="#overview">Open Overview</a>
             <a class="button button-secondary" href="#controls">Job Controls</a>
+            <a class="button button-secondary" href="#glossary">Glossary</a>
           </div>
         </div>
         <aside class="hero-panel">
@@ -175,7 +176,7 @@
             <p class="card-caption">
               A focused ideogram plus an analysis window track built from the current
               region-level outputs for the selected chromosome, with both broad scroll view
-              and a deeper zoomed detail mode.
+              and a deeper clickable zoomed detail mode.
             </p>
             <div id="selectedChromosomeVisual" class="visual-stage visual-stage-focus"></div>
             <p id="selectedChromosomeVisualNote" class="chart-note">
@@ -238,6 +239,37 @@
               </p>
             </div>
           </article>
+        </section>
+
+        <section class="panel" id="glossary">
+          <div class="section-header">
+            <div>
+              <p class="section-kicker">Glossary</p>
+              <h2>Bioinformatics terms used in the dashboard</h2>
+            </div>
+            <p class="section-copy">
+              Short definitions for the biology and data terms used throughout the dashboard.
+            </p>
+          </div>
+
+          <div class="glossary-grid">
+            <article class="glossary-card"><h3>Chromosome</h3><p>A large DNA molecule that carries part of the genome. Humans typically have chromosomes 1-22 plus X and Y.</p></article>
+            <article class="glossary-card"><h3>Gene</h3><p>A DNA region that can be transcribed into RNA and often translated into a protein or other functional product.</p></article>
+            <article class="glossary-card"><h3>ORF</h3><p>Open reading frame: a stretch of sequence that starts like a protein-coding region and continues without an in-frame stop codon.</p></article>
+            <article class="glossary-card"><h3>Candidate coding region</h3><p>A genomic window flagged as potentially protein-coding because it contains one or more ORFs and supportive sequence signals.</p></article>
+            <article class="glossary-card"><h3>CpG</h3><p>A cytosine followed by guanine on the same DNA strand. CpG-rich areas are often biologically important for gene regulation.</p></article>
+            <article class="glossary-card"><h3>GC content</h3><p>The percentage of bases in a region that are G or C. GC-rich regions can have different structural and functional properties than AT-rich regions.</p></article>
+            <article class="glossary-card"><h3>Motif</h3><p>A short recurring DNA pattern that may indicate a biological function, such as regulation, transcription, or sequence processing.</p></article>
+            <article class="glossary-card"><h3>Repeat</h3><p>A sequence pattern that occurs multiple times. Repeats can be short, long, or low-complexity and may affect genome structure and analysis difficulty.</p></article>
+            <article class="glossary-card"><h3>Homopolymer</h3><p>A run of the same base repeated many times, such as `AAAAAA` or `TTTTTT`.</p></article>
+            <article class="glossary-card"><h3>Start codon</h3><p>A sequence, usually `ATG`, that commonly marks the start of a protein-coding reading frame.</p></article>
+            <article class="glossary-card"><h3>Polyadenylation signal</h3><p>A short motif, commonly `AATAAA`, associated with RNA processing and transcript termination.</p></article>
+            <article class="glossary-card"><h3>Genomic window</h3><p>A fixed-size slice of the chromosome used for regional summaries like GC%, motif density, and ORF counts.</p></article>
+            <article class="glossary-card"><h3>Gene annotation</h3><p>Reference metadata describing known genes, transcripts, exons, and related features from sources like NCBI or Ensembl.</p></article>
+            <article class="glossary-card"><h3>Ideogram</h3><p>A simplified visual representation of a chromosome used here to show chromosome-scale context and analysis hotspots.</p></article>
+            <article class="glossary-card"><h3>Parquet</h3><p>A columnar data file format optimized for analytics. The pipeline stores outputs in Parquet so they can be queried efficiently.</p></article>
+            <article class="glossary-card"><h3>Athena</h3><p>A serverless AWS SQL query engine used to read the Parquet datasets directly from S3.</p></article>
+          </div>
         </section>
 
         <section class="panel" id="controls">
