@@ -1,42 +1,61 @@
 # BioIT Web App
 
-This folder contains the first website shell for the BioIT genome pipeline.
+This folder contains the deployed dashboard frontend for the BioIT genome pipeline.
 
-## Purpose
+## What Lives Here
 
-The app is designed to sit on top of the deployed AWS pipeline and provide:
+- `index.html` - full dashboard experience
+- `compact.html` - reviewer-friendly compact dashboard route
+- `styles.css` - shared styling for both dashboard pages
+- `app.js` - shared client logic, data loading, and visualization behavior
+- `config.js.example` - local template for the API base URL
 
-- job submission
-- pipeline status visibility
-- chromosome availability tracking
-- analytics entry points
-- region visualization hooks
+At deploy time, Terraform publishes this folder to the dashboard S3 bucket and serves it through CloudFront.
 
-## Current State
+## Runtime Model
 
-This is a frontend starter, not a deployed production app yet.
+The frontend talks to the deployed dashboard API for:
 
-It currently includes:
+- chromosome inventory
+- per-chromosome summary data
+- pattern and region tables
+- batch/full-analysis status
+- job submission actions
 
-- `index.html`
-- `styles.css`
-- `app.js`
+The live deployment currently uses:
 
-## Planned Backend
+- full dashboard: `index.html`
+- compact dashboard: `compact.html`
 
-The frontend is intended to talk to a future API layer with endpoints like:
+Both pages share the same `app.js` and `styles.css`.
 
-- `POST /api/jobs`
-- `POST /api/jobs/human-reference`
-- `GET /api/status/overview`
-- `GET /api/chromosomes`
-- `GET /api/results`
-- `POST /api/query`
+## Local Config
+
+For local or manual testing, create `config.js` from the example file and point it at the deployed API:
+
+```bash
+cp config.js.example config.js
+```
+
+Then set:
+
+```js
+window.BIOIT_API_BASE_URL = "https://<api-id>.execute-api.<region>.amazonaws.com";
+```
+
+Terraform can also generate and upload `config.js` during deployment.
 
 ## Open Locally
 
-You can open `index.html` directly in a browser for a visual prototype.
+You can open either page directly in a browser for static inspection:
 
-## Suggested Next Step
+- `index.html`
+- `compact.html`
 
-Add a new Lambda-backed API and wire the forms in `app.js` to real AWS endpoints.
+For full live behavior, the pages need a reachable API base URL in `config.js`.
+
+## Deployment Notes
+
+- Source of truth is the root `webapp/` folder in the repo.
+- `build.sh` copies this folder into `dist/terraform/webapp` when packaging deploy artifacts.
+- The deployed CloudFront dashboard should stay aligned with the files in this directory.
